@@ -1,0 +1,39 @@
+# OS metadata
+.DS_Store
+
+# Editor settings and temporary files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Meson / Ninja build output
+/build/
+/builddir/
+/meson-logs/
+/meson-private/
+/meson-info/
+/compile_commands.json
+/.ninja_log
+/.ninja_deps
+
+# Native build artifacts
+*.o
+*.obj
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.out
+
+# Coverage / profiling
+*.gcda
+*.gcno
+*.gcov
+*.profraw
+*.profdata
+
+
