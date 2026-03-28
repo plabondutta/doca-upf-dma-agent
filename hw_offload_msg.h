@@ -29,9 +29,11 @@ extern "C" {
 
 /* ── Operation type ─────────────────────────────────────────────────── */
 enum hw_offload_op {
-    HW_OP_CREATE  = 1,   /* Phase 1: create-only                       */
-    HW_OP_DELETE  = 2,   /* Future: delete a rule by hw_rule_id         */
-    HW_OP_UPDATE  = 3,   /* Future: modify an existing rule             */
+    HW_OP_CREATE      = 1,   /* create a new rule                          */
+    HW_OP_DELETE      = 2,   /* delete a rule by hw_rule_id                */
+    HW_OP_UPDATE_FAR  = 3,   /* update FAR (action/fwd change, BUFF⇄FORW)  */
+    HW_OP_UPDATE_QER  = 4,   /* update QER (meter rates / gate)             */
+    HW_OP_UPDATE_PDR  = 5,   /* update PDR (match fields / precedence)      */
 };
 
 /* ── Direction (derived from PDI sourceInterface) ──────────────────── */
