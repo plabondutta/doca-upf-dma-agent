@@ -29,6 +29,12 @@
 #include <doca_flow.h>
 #include <doca_log.h>
 
+/* DOCA 3.3 compat: DOCA_FLOW_NO_WAIT = 0 is documented but may be
+ * absent in some SDK builds; provide the constant if needed. */
+#ifndef DOCA_FLOW_NO_WAIT
+#  define DOCA_FLOW_NO_WAIT 0
+#endif
+
 #include "dpu_pipeline.h"
 
 DOCA_LOG_REGISTER(DPU_PIPELINE);
@@ -935,8 +941,8 @@ create_trtcm_meter(struct doca_flow_port *port,
     cfg.meter_cfg.alg = DOCA_FLOW_METER_ALGORITHM_TYPE_RFC2698;
     cfg.meter_cfg.cir = cir_bps;
     cfg.meter_cfg.cbs = (cir_bps / 100 > 4096) ? cir_bps / 100 : 4096;
-    cfg.meter_cfg.pir = pir_bps;
-    cfg.meter_cfg.pbs = (pir_bps / 100 > 4096) ? pir_bps / 100 : 4096;
+    cfg.meter_cfg.rfc2698.pir = pir_bps;
+    cfg.meter_cfg.rfc2698.pbs = (pir_bps / 100 > 4096) ? pir_bps / 100 : 4096;
 
     result = doca_flow_port_shared_resource_get(port,
                                                  DOCA_FLOW_SHARED_RESOURCE_METER,

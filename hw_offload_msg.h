@@ -13,7 +13,7 @@
  *     ohc_ipv4                : NBO         (struct in_addr, raw copy)
  *   - sdf_src_ip, sdf_dst_ip  : HOST order  (phb_parse_flow_description)
  *   - sdf_src_port, sdf_dst_port : HOST order
- *   - mbr_*/gbr_*             : HOST order, kbps
+ *   - mbr_N, gbr_N (N=ul,dl)  : HOST order, kbps
  *
  * SPDX-License-Identifier: Apache-2.0
  */

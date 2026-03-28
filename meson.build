@@ -15,6 +15,7 @@ project('dpu_agent', 'c',
     default_options: ['c_std=c11', 'warning_level=2'],
 )
 
+dpdk_dep        = dependency('libdpdk',     required: true)
 doca_common_dep = dependency('doca-common', required: true)
 doca_flow_dep   = dependency('doca-flow',   required: true)
 doca_comch_dep  = dependency('doca-comch',  required: true)
@@ -29,6 +30,7 @@ executable('dpu_agent',
         'dpu_shaper.c',
     ),
     dependencies: [
+        dpdk_dep,
         doca_common_dep,
         doca_flow_dep,
         doca_comch_dep,
