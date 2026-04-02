@@ -25,6 +25,7 @@
 
 #include <string.h>
 #include <arpa/inet.h>
+#include <rte_byteorder.h>
 
 #include <doca_flow.h>
 #include <doca_log.h>

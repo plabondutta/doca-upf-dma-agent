@@ -20,7 +20,7 @@
     },
     "doca_program_flags": {
         "comch-pci": "03:00.0",
-        "rep-pci": "",
+        "rep-pci": "81:00.0",
         "server-name": "dpu_agent",
         "n3-pci": "03:00.0",
         "n6-pci": "03:00.1",
@@ -28,10 +28,10 @@
         "n3-port": 0,
         "n6-port": 1,
         "vf-port": 2,
-        "upf-n3-ip": "",
-        "upf-n3-mac": "00:00:00:00:00:03",
+        "upf-n3-ip": "192.168.4.2",
+        "upf-n3-mac": "e8:9e:49:4e:fe:90",
         "gnb-mac": "00:00:00:00:00:04",
-        "upf-n6-mac": "00:00:00:00:00:01",
+        "upf-n6-mac": "e8:9e:49:4e:fe:91",
         "dn-gw-mac": "00:00:00:00:00:02"
     }
 }

@@ -15,6 +15,10 @@ project('dpu_agent', 'c',
     default_options: ['c_std=c11', 'warning_level=2'],
 )
 
+# Required by DOCA SDK: experimental API symbols (e.g. doca_flow_pipe_add_entry)
+# are only exported when this define is present at compile time.
+add_project_arguments('-D', 'DOCA_ALLOW_EXPERIMENTAL_API', language: 'c')
+
 dpdk_dep        = dependency('libdpdk',     required: true)
 doca_common_dep = dependency('doca-common', required: true)
 doca_flow_dep   = dependency('doca-flow',   required: true)
