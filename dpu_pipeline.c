@@ -1179,6 +1179,7 @@ dpu_pipeline_insert_rule(dpu_pipeline_ctx_t *ctx, const hw_offload_msg_t *msg)
             match_mask.inner.transport.src_port = UINT16_MAX;
         if (msg->has_sdf && msg->sdf_dst_port > 0)
             match_mask.inner.transport.dst_port = UINT16_MAX;
+        (void)match_mask; /* Kept for future ACL pipe conversion; unused with BASIC pipe */
 
         /* Actions: pkt_meta (decap + L2 inject from pipe template) */
         struct doca_flow_actions actions = {};
@@ -1293,6 +1294,7 @@ dpu_pipeline_insert_rule(dpu_pipeline_ctx_t *ctx, const hw_offload_msg_t *msg)
             dl_mask.outer.transport.src_port = UINT16_MAX;
         if (msg->has_sdf && msg->sdf_src_port > 0)
             dl_mask.outer.transport.dst_port = UINT16_MAX;
+        (void)dl_mask; /* Kept for future ACL pipe conversion; unused with BASIC pipe */
 
         struct doca_flow_actions dl_actions = {};
         dl_actions.meta.pkt_meta = htonl(msg->hw_rule_id);

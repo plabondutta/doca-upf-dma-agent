@@ -34,6 +34,8 @@
 
 #include <doca_argp.h>
 #include <doca_comch.h>
+#include <doca_compat.h>  /* Must precede doca_ctx.h — defines DOCA_STABLE macro */
+#include <doca_ctx.h>
 #include <doca_dev.h>
 #include <doca_error.h>
 #include <doca_log.h>
