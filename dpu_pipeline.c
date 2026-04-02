@@ -219,7 +219,7 @@ build_to_host_pipe(dpu_pipeline_ctx_t *ctx)
     if (result != DOCA_SUCCESS) return result;
 
     struct doca_flow_pipe_entry *entry;
-    result = doca_flow_pipe_add_entry(0, ctx->to_host_pipe,
+    result = doca_flow_pipe_basic_add_entry(0, ctx->to_host_pipe,
                                        &match, 0, &actions, NULL, &fwd,
                                        0, NULL, &entry);
     if (result != DOCA_SUCCESS)
@@ -285,8 +285,8 @@ build_to_dpu_arm_pipe(dpu_pipeline_ctx_t *ctx)
 
     /* Insert a single wildcard catch-all entry */
     struct doca_flow_pipe_entry *entry;
-    result = doca_flow_pipe_add_entry(0, ctx->to_dpu_arm_pipe,
-                                       &match, NULL, &actions, NULL, &fwd,
+    result = doca_flow_pipe_basic_add_entry(0, ctx->to_dpu_arm_pipe,
+                                       &match, 0, &actions, NULL, &fwd,
                                        0, NULL, &entry);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("TO_DPU_ARM entry insert failed");
@@ -322,10 +322,10 @@ build_color_gate_policed_pipe(dpu_pipeline_ctx_t *ctx,
     doca_flow_pipe_cfg_set_nr_entries(pipe_cfg, 4);
 
     struct doca_flow_match match = {};
-    match.parser_meta.meter_color = UINT32_MAX;
+    match.parser_meta.meter_color = UINT8_MAX;
 
     struct doca_flow_match mask = {};
-    mask.parser_meta.meter_color = UINT32_MAX;
+    mask.parser_meta.meter_color = UINT8_MAX;
 
     doca_flow_pipe_cfg_set_match(pipe_cfg, &match, &mask);
 
@@ -350,7 +350,7 @@ build_color_gate_policed_pipe(dpu_pipeline_ctx_t *ctx,
 
     struct doca_flow_match green = {};
     green.parser_meta.meter_color = DOCA_FLOW_METER_COLOR_GREEN;
-    result = doca_flow_pipe_add_entry(0, *pipe_out,
+    result = doca_flow_pipe_basic_add_entry(0, *pipe_out,
                                        &green, 0, &actions, NULL, &fwd,
                                        0, NULL, &entry);
     if (result != DOCA_SUCCESS) {
@@ -360,7 +360,7 @@ build_color_gate_policed_pipe(dpu_pipeline_ctx_t *ctx,
 
     struct doca_flow_match yellow = {};
     yellow.parser_meta.meter_color = DOCA_FLOW_METER_COLOR_YELLOW;
-    result = doca_flow_pipe_add_entry(0, *pipe_out,
+    result = doca_flow_pipe_basic_add_entry(0, *pipe_out,
                                        &yellow, 0, &actions, NULL, &fwd,
                                        0, NULL, &entry);
     if (result != DOCA_SUCCESS) {
@@ -400,10 +400,10 @@ build_color_gate_shaped_pipe(dpu_pipeline_ctx_t *ctx,
     doca_flow_pipe_cfg_set_nr_entries(pipe_cfg, 4);
 
     struct doca_flow_match match = {};
-    match.parser_meta.meter_color = UINT32_MAX;
+    match.parser_meta.meter_color = UINT8_MAX;
 
     struct doca_flow_match mask = {};
-    mask.parser_meta.meter_color = UINT32_MAX;
+    mask.parser_meta.meter_color = UINT8_MAX;
 
     doca_flow_pipe_cfg_set_match(pipe_cfg, &match, &mask);
 
@@ -433,7 +433,7 @@ build_color_gate_shaped_pipe(dpu_pipeline_ctx_t *ctx,
     };
     struct doca_flow_match green = {};
     green.parser_meta.meter_color = DOCA_FLOW_METER_COLOR_GREEN;
-    result = doca_flow_pipe_add_entry(0, *pipe_out,
+    result = doca_flow_pipe_basic_add_entry(0, *pipe_out,
                                        &green, 0, &actions, NULL, &fwd_wire,
                                        0, NULL, &entry);
     if (result != DOCA_SUCCESS) {
@@ -453,7 +453,7 @@ build_color_gate_shaped_pipe(dpu_pipeline_ctx_t *ctx,
     };
     struct doca_flow_match yellow = {};
     yellow.parser_meta.meter_color = DOCA_FLOW_METER_COLOR_YELLOW;
-    result = doca_flow_pipe_add_entry(0, *pipe_out,
+    result = doca_flow_pipe_basic_add_entry(0, *pipe_out,
                                        &yellow, 0, &actions, NULL, &fwd_rss,
                                        0, NULL, &entry);
     if (result != DOCA_SUCCESS) {
@@ -791,10 +791,10 @@ build_root_pipe(dpu_pipeline_ctx_t *ctx)
         };
 
         struct doca_flow_pipe_entry *entry;
-        result = doca_flow_pipe_control_add_entry(0, 0, ctx->root_pipe,
+        result = doca_flow_pipe_control_add_entry(0, ctx->root_pipe,
                                                    &match, &mask,
                                                    NULL, NULL, NULL, NULL,
-                                                   NULL, &fwd, NULL, &entry);
+                                                   NULL, 0, &fwd, NULL, &entry);
         if (result != DOCA_SUCCESS) {
             DOCA_LOG_ERR("ROOT: UL control entry failed");
             return result;
@@ -817,10 +817,10 @@ build_root_pipe(dpu_pipeline_ctx_t *ctx)
         };
 
         struct doca_flow_pipe_entry *entry;
-        result = doca_flow_pipe_control_add_entry(0, 1, ctx->root_pipe,
+        result = doca_flow_pipe_control_add_entry(0, ctx->root_pipe,
                                                    &match, &mask,
                                                    NULL, NULL, NULL, NULL,
-                                                   NULL, &fwd, NULL, &entry);
+                                                   NULL, 1, &fwd, NULL, &entry);
         if (result != DOCA_SUCCESS) {
             DOCA_LOG_ERR("ROOT: DL control entry failed");
             return result;
@@ -855,10 +855,10 @@ build_root_pipe(dpu_pipeline_ctx_t *ctx)
 
             struct doca_flow_pipe_entry *rentry;
             result = doca_flow_pipe_control_add_entry(
-                0, 2, ctx->root_pipe,
+                0, ctx->root_pipe,
                 &rmatch, &rmask,
                 NULL, NULL, NULL, NULL,
-                NULL, &rfwd, NULL, &rentry);
+                NULL, 2, &rfwd, NULL, &rentry);
             if (result != DOCA_SUCCESS) {
                 DOCA_LOG_ERR("ROOT: UL reinject entry failed: %s",
                              doca_error_get_descr(result));
@@ -882,10 +882,10 @@ build_root_pipe(dpu_pipeline_ctx_t *ctx)
 
             struct doca_flow_pipe_entry *rentry;
             result = doca_flow_pipe_control_add_entry(
-                0, 3, ctx->root_pipe,
+                0, ctx->root_pipe,
                 &rmatch, &rmask,
                 NULL, NULL, NULL, NULL,
-                NULL, &rfwd, NULL, &rentry);
+                NULL, 3, &rfwd, NULL, &rentry);
             if (result != DOCA_SUCCESS) {
                 DOCA_LOG_ERR("ROOT: DL reinject entry failed: %s",
                              doca_error_get_descr(result));
@@ -1203,8 +1203,13 @@ dpu_pipeline_insert_rule(dpu_pipeline_ctx_t *ctx, const hw_offload_msg_t *msg)
         };
 
         struct doca_flow_pipe_entry *entry;
-        result = doca_flow_pipe_add_entry(0, ctx->ul_match_pipes[bucket],
-                                           &match, &match_mask, &actions,
+        /* DOCA 3.3 migration: doca_flow_pipe_basic_add_entry replaces
+         * doca_flow_pipe_add_entry. Per-entry match_mask is no longer
+         * supported (arg 4 is now action_idx, not mask). SDF wildcard
+         * entries that need different masks per entry may require
+         * converting UL_MATCH to DOCA_FLOW_PIPE_ACL type. */
+        result = doca_flow_pipe_basic_add_entry(0, ctx->ul_match_pipes[bucket],
+                                           &match, 0, &actions,
                                            mon_ptr, &ul_fwd,
                                            0, NULL, &entry);
         if (result != DOCA_SUCCESS) {
@@ -1310,8 +1315,11 @@ dpu_pipeline_insert_rule(dpu_pipeline_ctx_t *ctx, const hw_offload_msg_t *msg)
         };
 
         struct doca_flow_pipe_entry *dl_entry;
-        result = doca_flow_pipe_add_entry(0, ctx->dl_match_pipes[bucket],
-                                           &dl_match, &dl_mask, &dl_actions,
+        /* DOCA 3.3 migration: same note as UL_MATCH above —
+         * per-entry match_mask dropped, DL_MATCH SDF wildcard entries
+         * may need ACL pipe conversion for full mask flexibility. */
+        result = doca_flow_pipe_basic_add_entry(0, ctx->dl_match_pipes[bucket],
+                                           &dl_match, 0, &dl_actions,
                                            dl_mon_ptr, &dl_fwd,
                                            0, NULL, &dl_entry);
         if (result != DOCA_SUCCESS) {
@@ -1376,7 +1384,7 @@ dpu_pipeline_insert_rule(dpu_pipeline_ctx_t *ctx, const hw_offload_msg_t *msg)
             encap_actions.encap_cfg.encap.tun.gtp_ext_psc_qfi = msg->encap_qfi;
 
             struct doca_flow_pipe_entry *encap_entry;
-            result = doca_flow_pipe_add_entry(0, ctx->dl_encap_pipe,
+            result = doca_flow_pipe_basic_add_entry(0, ctx->dl_encap_pipe,
                                                &encap_match, 0, &encap_actions,
                                                NULL, NULL,
                                                0, NULL, &encap_entry);
@@ -1553,7 +1561,7 @@ dpu_pipeline_update_far(dpu_pipeline_ctx_t *ctx, const hw_offload_msg_t *msg)
             .next_pipe = ctx->to_dpu_arm_pipe,
         };
 
-        doca_error_t result = doca_flow_pipe_update_entry(
+        doca_error_t result = doca_flow_pipe_basic_update_entry(
             0, pipe, 0,
             NULL,       /* actions: unchanged */
             NULL,       /* monitor: unchanged */
@@ -1605,7 +1613,7 @@ dpu_pipeline_update_far(dpu_pipeline_ctx_t *ctx, const hw_offload_msg_t *msg)
                 .next_pipe = color_gate,
             };
 
-            doca_error_t result = doca_flow_pipe_update_entry(
+            doca_error_t result = doca_flow_pipe_basic_update_entry(
                 0, pipe, 0,
                 NULL,        /* actions: unchanged */
                 NULL,        /* monitor: unchanged */
@@ -1650,7 +1658,7 @@ dpu_pipeline_update_far(dpu_pipeline_ctx_t *ctx, const hw_offload_msg_t *msg)
             encap_actions.encap_cfg.encap.tun.gtp_ext_psc_qfi =
                 msg->encap_qfi;
 
-            doca_error_t result = doca_flow_pipe_update_entry(
+            doca_error_t result = doca_flow_pipe_basic_update_entry(
                 0, ctx->dl_encap_pipe, 0,
                 &encap_actions, NULL, NULL,
                 DOCA_FLOW_NO_WAIT, rec->dl_encap_entry);
@@ -1773,7 +1781,7 @@ dpu_pipeline_update_qer(dpu_pipeline_ctx_t *ctx, const hw_offload_msg_t *msg)
     /* Single update_entry call: updates meter AND fwd atomically when
      * a GBR mode transition occurs, eliminating the window where the
      * meter generates YELLOW but the fwd still points to the wrong gate. */
-    result = doca_flow_pipe_update_entry(0, pipe, 0,
+    result = doca_flow_pipe_basic_update_entry(0, pipe, 0,
                                           NULL,      /* actions: unchanged */
                                           &mon,      /* monitor: new or zeroed */
                                           fwd_ptr,   /* fwd: new gate or NULL */
@@ -1861,7 +1869,7 @@ dpu_pipeline_downgrade_to_policed(dpu_pipeline_ctx_t *ctx, uint32_t hw_rule_id)
         .next_pipe = policed_gate,
     };
 
-    doca_error_t result = doca_flow_pipe_update_entry(
+    doca_error_t result = doca_flow_pipe_basic_update_entry(
         0, pipe, 0,
         NULL,   /* actions: unchanged */
         NULL,   /* monitor: unchanged */
@@ -1942,7 +1950,7 @@ dpu_pipeline_update_dlencap_only(dpu_pipeline_ctx_t *ctx,
     encap_actions.encap_cfg.encap.tun.gtp_next_ext_hdr_type = GTP_EXT_PSC;
     encap_actions.encap_cfg.encap.tun.gtp_ext_psc_qfi = msg->encap_qfi;
 
-    doca_error_t result = doca_flow_pipe_update_entry(
+    doca_error_t result = doca_flow_pipe_basic_update_entry(
         0, ctx->dl_encap_pipe, 0,
         &encap_actions, NULL, NULL,
         DOCA_FLOW_NO_WAIT, rec->dl_encap_entry);
