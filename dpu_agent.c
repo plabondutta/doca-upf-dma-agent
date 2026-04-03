@@ -89,8 +89,8 @@ static dpu_agent_cfg_t g_cfg = {
     .n6_pci          = "03:00.1",
     .vf_pci          = "",
     .n3_port_id      = 0,
-    .n6_port_id      = 1,
-    .host_vf_port_id = 2,
+    .n6_port_id      = 2,
+    .host_vf_port_id = 1,
     .upf_n3_ip_str   = "",
     .upf_n3_mac_str  = "00:00:00:00:00:03",
     .gnb_mac_str     = "00:00:00:00:00:04",
@@ -783,12 +783,17 @@ setup_proxy_port(void)
 }
 
 /**
- * Setup the N6 PF port with minimal DPDK queues (1 Rx + 1 Tx).
+ * Setup the N6 PF port with DPDK queues matching the proxy port count.
  *
- * NVIDIA DOCA Flow samples configure ALL PF ports with Rx/Tx queues and
- * start them before doca_flow_port_start().  Representor ports are skipped
- * (they have no queues).  The N6 PF needs at least 1 queue so that
- * doca_flow_port_start() can snapshot a valid queue configuration.
+ * NVIDIA DOCA Flow samples configure ALL PF ports with the SAME number of
+ * Rx/Tx queues.  In HWS mode, doca_flow_cfg_set_pipe_queues(N) requires
+ * every started port to provide N Rx queues for the internal HWS queue
+ * mapping.  If any port has fewer queues, RSS pipe creation fails with
+ * "logical queue id X not exist".
+ *
+ * We mirror the proxy port's TOTAL_RX_QUEUES and TOTAL_TX_QUEUES here
+ * so that pipe_queues == TOTAL_RX_QUEUES is satisfied on all PF ports.
+ * Representor ports are skipped (no DPDK queues in switch mode).
  *
  * @param n6_dpdk_port_id  DPDK port ID of the N6 PF (typically 2 when
  *                          N3 is probed with representors first).
@@ -800,28 +805,35 @@ setup_n6_port(uint16_t n6_dpdk_port_id)
     struct rte_eth_conf port_conf;
 
     memset(&port_conf, 0, sizeof(port_conf));
+    port_conf.rxmode.mq_mode = RTE_ETH_MQ_RX_RSS;
 
-    ret = rte_eth_dev_configure(n6_dpdk_port_id, 1, 1, &port_conf);
+    ret = rte_eth_dev_configure(n6_dpdk_port_id,
+                                 TOTAL_RX_QUEUES, TOTAL_TX_QUEUES,
+                                 &port_conf);
     if (ret < 0) {
         DOCA_LOG_ERR("Failed to configure N6 port %u: %d",
                      n6_dpdk_port_id, ret);
         return DOCA_ERROR_DRIVER;
     }
 
-    ret = rte_eth_rx_queue_setup(n6_dpdk_port_id, 0, 512,
-                                  rte_socket_id(), NULL, g_mbuf_pool);
-    if (ret < 0) {
-        DOCA_LOG_ERR("Failed to setup Rx queue on N6 port %u: %d",
-                     n6_dpdk_port_id, ret);
-        return DOCA_ERROR_DRIVER;
+    for (int q = 0; q < TOTAL_RX_QUEUES; q++) {
+        ret = rte_eth_rx_queue_setup(n6_dpdk_port_id, q, 512,
+                                      rte_socket_id(), NULL, g_mbuf_pool);
+        if (ret < 0) {
+            DOCA_LOG_ERR("Failed to setup Rx queue %d on N6 port %u: %d",
+                         q, n6_dpdk_port_id, ret);
+            return DOCA_ERROR_DRIVER;
+        }
     }
 
-    ret = rte_eth_tx_queue_setup(n6_dpdk_port_id, 0, 512,
-                                  rte_socket_id(), NULL);
-    if (ret < 0) {
-        DOCA_LOG_ERR("Failed to setup Tx queue on N6 port %u: %d",
-                     n6_dpdk_port_id, ret);
-        return DOCA_ERROR_DRIVER;
+    for (int q = 0; q < TOTAL_TX_QUEUES; q++) {
+        ret = rte_eth_tx_queue_setup(n6_dpdk_port_id, q, 512,
+                                      rte_socket_id(), NULL);
+        if (ret < 0) {
+            DOCA_LOG_ERR("Failed to setup Tx queue %d on N6 port %u: %d",
+                         q, n6_dpdk_port_id, ret);
+            return DOCA_ERROR_DRIVER;
+        }
     }
 
     ret = rte_eth_dev_start(n6_dpdk_port_id);
@@ -831,8 +843,8 @@ setup_n6_port(uint16_t n6_dpdk_port_id)
         return DOCA_ERROR_DRIVER;
     }
 
-    DOCA_LOG_INFO("N6 port setup: port=%u, 1 Rx queue, 1 Tx queue",
-                  n6_dpdk_port_id);
+    DOCA_LOG_INFO("N6 port setup: port=%u, %d Rx queues, %d Tx queues",
+                  n6_dpdk_port_id, TOTAL_RX_QUEUES, TOTAL_TX_QUEUES);
     return DOCA_SUCCESS;
 }
 
@@ -1093,9 +1105,14 @@ main(int argc, char *argv[])
 
     /* ── DOCA Flow pipeline ────────────────────────────────────────── */
     dpu_port_cfg_t port_cfg = {};
-    port_cfg.n3_port_id      = (uint16_t)g_cfg.n3_port_id;
-    port_cfg.n6_port_id      = (uint16_t)g_cfg.n6_port_id;
-    port_cfg.host_vf_port_id = (uint16_t)g_cfg.host_vf_port_id;
+    /* Port IDs derived from deterministic probe order in main():
+     *   probe_with_representors(N3 + host_rep) → DPDK port 0, 1
+     *   probe(N6)                               → DPDK port 2
+     * These are NOT read from config — the probe order is our source
+     * of truth.  JSON "n3-port"/"n6-port"/"vf-port" are ignored. */
+    port_cfg.n3_port_id      = 0;  /* probed first  */
+    port_cfg.host_vf_port_id = 1;  /* probed with N3 */
+    port_cfg.n6_port_id      = 2;  /* probed last   */
     port_cfg.n3_dev          = g_n3_dev;
     port_cfg.n6_dev          = g_n6_dev;
     port_cfg.host_vf_dev     = g_vf_dev;
@@ -1131,7 +1148,7 @@ main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
-    result = setup_n6_port(2);  /* DPDK port 2 — N6 PF: 1 Rx + 1 Tx */
+    result = setup_n6_port(port_cfg.n6_port_id);  /* DPDK port 2 — N6 PF */
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("N6 port setup failed: %s", doca_error_get_descr(result));
         comch_server_destroy();
