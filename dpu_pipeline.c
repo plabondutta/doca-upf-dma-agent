@@ -688,8 +688,7 @@ build_ul_decap_pipe(dpu_pipeline_ctx_t *ctx)
     };
 
     struct doca_flow_fwd fwd_miss = {
-        .type = DOCA_FLOW_FWD_PORT,
-        .port_id = ctx->port_cfg.n6_port_id,
+        .type = DOCA_FLOW_FWD_DROP,
     };
 
     result = doca_flow_pipe_create(pipe_cfg, &fwd, &fwd_miss,
