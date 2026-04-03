@@ -38,6 +38,7 @@
 #include <doca_compat.h>  /* Must precede doca_ctx.h — defines DOCA_STABLE macro */
 #include <doca_ctx.h>
 #include <doca_dev.h>
+#include <doca_dpdk.h>    /* doca_dpdk_port_probe — DOCA↔DPDK bridge */
 #include <doca_error.h>
 #include <doca_log.h>
 #include <doca_pe.h>
@@ -637,9 +638,9 @@ parse_mac(const char *str, uint8_t mac[6])
  * Called by doca_argp_start() after it separates DPDK flags from app flags.
  *
  * IMPORTANT: At this point only EAL is available.  DPDK ethdev ports do
- * NOT exist yet — they are created later by doca_flow_port_start() inside
- * dpu_pipeline_create_ports().  Any port configuration (queues, mbuf pool,
- * etc.) must happen after port creation, not here.
+ * NOT exist yet — they are created later by doca_dpdk_port_probe() which
+ * establishes the DOCA↔DPDK bridge mapping.  Any port configuration
+ * (queues, mbuf pool, etc.) must happen after the probe, not here.
  */
 static doca_error_t
 dpdk_init_cb(int argc, char **argv)
@@ -944,10 +945,28 @@ main(int argc, char *argv[])
         doca_argp_destroy();
         return EXIT_FAILURE;
     }
+    /* Establish DOCA↔DPDK bridge mapping for N3 PF.
+     * Without this, doca_flow_port_start() cannot find the DPDK port's
+     * Rx queues — RSS pipe creation will fail with "queue id not exist". */
+    dev_result = doca_dpdk_port_probe(g_n3_dev, "dv_flow_en=2");
+    if (dev_result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to probe N3 DPDK port: %s",
+                     doca_error_get_descr(dev_result));
+        doca_argp_destroy();
+        return EXIT_FAILURE;
+    }
+
     dev_result = open_doca_device_by_pci(g_cfg.n6_pci, &g_n6_dev);
     if (dev_result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Cannot open N6 device %s: %s",
                      g_cfg.n6_pci, doca_error_get_descr(dev_result));
+        doca_argp_destroy();
+        return EXIT_FAILURE;
+    }
+    dev_result = doca_dpdk_port_probe(g_n6_dev, "dv_flow_en=2");
+    if (dev_result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to probe N6 DPDK port: %s",
+                     doca_error_get_descr(dev_result));
         doca_argp_destroy();
         return EXIT_FAILURE;
     }

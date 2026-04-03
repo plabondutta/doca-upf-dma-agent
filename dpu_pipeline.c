@@ -104,7 +104,7 @@ entry_process_cb(struct doca_flow_pipe_entry *entry,
  * ═══════════════════════════════════════════════════════════════════════ */
 
 static doca_error_t
-init_doca_flow(void)
+init_doca_flow(uint32_t pipe_queues)
 {
     struct doca_flow_cfg *cfg;
     doca_error_t result;
@@ -112,7 +112,7 @@ init_doca_flow(void)
     result = doca_flow_cfg_create(&cfg);
     if (result != DOCA_SUCCESS) return result;
 
-    doca_flow_cfg_set_pipe_queues(cfg, 1);
+    doca_flow_cfg_set_pipe_queues(cfg, pipe_queues);
     doca_flow_cfg_set_nr_counters(cfg, 4096);
     doca_flow_cfg_set_nr_meters(cfg, 4096);
     doca_flow_cfg_set_mode_args(cfg, "switch,isolated,hws");
@@ -978,9 +978,11 @@ dpu_pipeline_create_ports(dpu_pipeline_ctx_t *ctx,
         ctx->nr_shaper_rss_queues = n;
     }
 
-    result = init_doca_flow();
+    result = init_doca_flow(ctx->nr_rss_queues + ctx->nr_shaper_rss_queues);
     if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("DOCA Flow init failed: %s", doca_error_get_descr(result));
+        DOCA_LOG_ERR("DOCA Flow init failed (pipe_queues=%u): %s",
+                     ctx->nr_rss_queues + ctx->nr_shaper_rss_queues,
+                     doca_error_get_descr(result));
         return result;
     }
 
