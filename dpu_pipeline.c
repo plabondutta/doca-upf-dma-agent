@@ -495,23 +495,17 @@ build_ul_match_pipes(dpu_pipeline_ctx_t *ctx)
         doca_flow_pipe_cfg_set_is_root(pipe_cfg, false);
         doca_flow_pipe_cfg_set_nr_entries(pipe_cfg, 2048);
 
-        /* Match: TEID + QFI + UE IP (CHANGEABLE per-entry).
-         * SDF fields (dst_ip, proto, ports) are intentionally omitted so
-         * that their pipe-level mask is 0 → IGNORED (wildcard).  This
-         * allows catch-all PDRs with no SDF filter to match all traffic. */
+        /* Match: TEID only (CHANGEABLE per-entry).
+         * BRINGUP: QFI + inner fields stripped — FW 32.43.2402 matcher
+         * doesn't support inner/extension parsing in FDB HWS mode.
+         * TODO: restore QFI + UE IP match after FW upgrade. */
         struct doca_flow_match match = {};
         match.tun.type = DOCA_FLOW_TUN_GTPU;
         match.tun.gtp_teid = UINT32_MAX;
-        match.tun.gtp_ext_psc_qfi = UINT8_MAX;
-        match.inner.l3_type = DOCA_FLOW_L3_TYPE_IP4;
-        match.inner.ip4.src_ip = UINT32_MAX;                 /* UE IP */
 
         struct doca_flow_match mask = {};
         mask.tun.type = DOCA_FLOW_TUN_GTPU;
         mask.tun.gtp_teid = UINT32_MAX;
-        mask.tun.gtp_ext_psc_qfi = UINT8_MAX;
-        mask.inner.l3_type = DOCA_FLOW_L3_TYPE_IP4;
-        mask.inner.ip4.src_ip = UINT32_MAX;
 
         doca_flow_pipe_cfg_set_match(pipe_cfg, &match, &mask);
 
@@ -1178,14 +1172,10 @@ dpu_pipeline_insert_rule(dpu_pipeline_ctx_t *ctx, const hw_offload_msg_t *msg)
                                      msg->gbr_ul, msg->mbr_ul);
         if (result != DOCA_SUCCESS) return result;
 
-        /* Match: TEID + QFI + UE IP only.
-         * SDF fields are wildcarded at the pipe level (mask=0). */
+        /* Match: TEID only (bringup — QFI + UE IP stripped). */
         struct doca_flow_match match = {};
         match.tun.type = DOCA_FLOW_TUN_GTPU;
         match.tun.gtp_teid = htonl(msg->teid);
-        match.tun.gtp_ext_psc_qfi = msg->qfi;
-        match.inner.l3_type = DOCA_FLOW_L3_TYPE_IP4;
-        match.inner.ip4.src_ip = msg->ue_ipv4.s_addr;  /* NBO */
 
         /* Actions: NONE for bringup (no pkt_meta, no meter on pipe) */
 
