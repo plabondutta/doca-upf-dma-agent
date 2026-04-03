@@ -515,25 +515,16 @@ build_ul_match_pipes(dpu_pipeline_ctx_t *ctx)
 
         doca_flow_pipe_cfg_set_match(pipe_cfg, &match, &mask);
 
-        /* Actions: pkt_meta only.
-         * GTP decap is split into a separate UL_DECAP pipe to stay
-         * within the BF3 ARGUMENT_64B hardware descriptor limit.
-         * REFORMAT + pkt_meta + meter + changeable fwd exceeded 64B
-         * when combined in one pipe. */
-        struct doca_flow_actions actions = {};
-        actions.meta.pkt_meta = UINT32_MAX;  /* changeable per-entry */
+        /* Actions: NONE for bringup (pkt_meta requires MODIFY_HEADER
+         * which needs ARGUMENT_64B — not available on current FW).
+         * TODO: restore pkt_meta + meter when FW is updated. */
 
-        struct doca_flow_actions *actions_arr[] = { &actions };
-        doca_flow_pipe_cfg_set_actions(pipe_cfg, actions_arr, NULL, NULL, 1);
+        /* Monitor: NONE for bringup (meter disabled) */
 
-        /* Monitor: shared meter (set per-entry; skipped when no QER) */
-        struct doca_flow_monitor monitor = {};
-        monitor.meter_type = DOCA_FLOW_RESOURCE_TYPE_SHARED;
-        doca_flow_pipe_cfg_set_monitor(pipe_cfg, &monitor);
-
-        /* Hit → CHANGEABLE (per-entry fwd target: UL_COLOR_GATE or TO_DPU_ARM) */
+        /* Hit → UL_DECAP directly (skip color gate for bringup) */
         struct doca_flow_fwd fwd = {
-            .type = DOCA_FLOW_FWD_CHANGEABLE,
+            .type = DOCA_FLOW_FWD_PIPE,
+            .next_pipe = ctx->ul_decap_pipe,
         };
 
         /* Miss → next lower priority bucket, or TO_HOST */
@@ -604,21 +595,16 @@ build_dl_match_pipes(dpu_pipeline_ctx_t *ctx)
 
         doca_flow_pipe_cfg_set_match(pipe_cfg, &match, &mask);
 
-        /* Actions: pkt_meta (changeable) */
-        struct doca_flow_actions actions = {};
-        actions.meta.pkt_meta = UINT32_MAX;
+        /* Actions: NONE for bringup (pkt_meta requires MODIFY_HEADER
+         * which needs ARGUMENT_64B — not available on current FW).
+         * TODO: restore pkt_meta + meter when FW is updated. */
 
-        struct doca_flow_actions *actions_arr[] = { &actions };
-        doca_flow_pipe_cfg_set_actions(pipe_cfg, actions_arr, NULL, NULL, 1);
+        /* Monitor: NONE for bringup (meter disabled) */
 
-        /* Monitor: shared meter */
-        struct doca_flow_monitor monitor = {};
-        monitor.meter_type = DOCA_FLOW_RESOURCE_TYPE_SHARED;
-        doca_flow_pipe_cfg_set_monitor(pipe_cfg, &monitor);
-
-        /* Hit → CHANGEABLE (per-entry fwd target: DL_COLOR_GATE or TO_DPU_ARM) */
+        /* Hit → DL_ENCAP directly (skip color gate for bringup) */
         struct doca_flow_fwd fwd = {
-            .type = DOCA_FLOW_FWD_CHANGEABLE,
+            .type = DOCA_FLOW_FWD_PIPE,
+            .next_pipe = ctx->dl_encap_pipe,
         };
 
         /* Miss → next bucket or TO_HOST */
@@ -1201,32 +1187,16 @@ dpu_pipeline_insert_rule(dpu_pipeline_ctx_t *ctx, const hw_offload_msg_t *msg)
         match.inner.l3_type = DOCA_FLOW_L3_TYPE_IP4;
         match.inner.ip4.src_ip = msg->ue_ipv4.s_addr;  /* NBO */
 
-        /* Actions: pkt_meta only (decap is in UL_DECAP pipe) */
-        struct doca_flow_actions actions = {};
-        actions.meta.pkt_meta = htonl(msg->hw_rule_id);
+        /* Actions: NONE for bringup (no pkt_meta, no meter on pipe) */
 
-        /* Monitor: attach shared meter if allocated */
-        struct doca_flow_monitor monitor = {};
-        struct doca_flow_monitor *mon_ptr = NULL;
-        if (meter_id != NO_METER_ID) {
-            monitor.meter_type = DOCA_FLOW_RESOURCE_TYPE_SHARED;
-            monitor.shared_meter.shared_meter_id = meter_id;
-            mon_ptr = &monitor;
-        }
+        /* Monitor: NONE for bringup */
 
-        /* Per-entry fwd: select policed vs shaped color gate based on GBR */
-        bool ul_is_gbr = (msg->gbr_ul > 0 &&
-                          ctx->ul_color_gate_shaped_pipe != NULL);
-        struct doca_flow_fwd ul_fwd = {
-            .type = DOCA_FLOW_FWD_PIPE,
-            .next_pipe = ul_is_gbr ? ctx->ul_color_gate_shaped_pipe
-                                   : ctx->ul_color_gate_policed_pipe,
-        };
+        /* Fwd: pipe fwd is fixed to UL_DECAP, no per-entry fwd needed */
 
         struct doca_flow_pipe_entry *entry;
         result = doca_flow_pipe_basic_add_entry(0, ctx->ul_match_pipes[bucket],
-                                           &match, 0, &actions,
-                                           mon_ptr, &ul_fwd,
+                                           &match, 0, NULL,
+                                           NULL, NULL,
                                            0, NULL, &entry);
         if (result != DOCA_SUCCESS) {
             DOCA_LOG_ERR("UL entry failed hw_rule_id=%u bucket=%d: %s",
@@ -1263,7 +1233,7 @@ dpu_pipeline_insert_rule(dpu_pipeline_ctx_t *ctx, const hw_offload_msg_t *msg)
         rec->direction    = HW_DIR_UPLINK;
         rec->current_mode = DPU_MODE_FAST;
         rec->meter_id     = meter_id;
-        rec->is_gbr_flow  = ul_is_gbr;
+        rec->is_gbr_flow  = false;  /* bringup: no GBR distinction */
 
         doca_flow_entries_process(ctx->switch_port, 0, 0, 0);
 
@@ -1271,7 +1241,7 @@ dpu_pipeline_insert_rule(dpu_pipeline_ctx_t *ctx, const hw_offload_msg_t *msg)
                       "meter=%s gbr=%s",
                       msg->hw_rule_id, msg->teid, msg->qfi, bucket,
                       (meter_id != NO_METER_ID) ? "yes" : "none",
-                      ul_is_gbr ? "shaped" : "policed");
+                      "n/a(bringup)");
 
     } else {
         /* ── DOWNLINK ────────────────────────────────────────────────── */
@@ -1287,30 +1257,16 @@ dpu_pipeline_insert_rule(dpu_pipeline_ctx_t *ctx, const hw_offload_msg_t *msg)
         dl_match.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
         dl_match.outer.ip4.dst_ip = msg->ue_ipv4.s_addr;  /* NBO */
 
-        struct doca_flow_actions dl_actions = {};
-        dl_actions.meta.pkt_meta = htonl(msg->hw_rule_id);
+        /* Actions: NONE for bringup (no pkt_meta, no meter on pipe) */
 
-        struct doca_flow_monitor dl_monitor = {};
-        struct doca_flow_monitor *dl_mon_ptr = NULL;
-        if (meter_id != NO_METER_ID) {
-            dl_monitor.meter_type = DOCA_FLOW_RESOURCE_TYPE_SHARED;
-            dl_monitor.shared_meter.shared_meter_id = meter_id;
-            dl_mon_ptr = &dl_monitor;
-        }
+        /* Monitor: NONE for bringup */
 
-        /* Per-entry fwd: select policed vs shaped color gate based on GBR */
-        bool dl_is_gbr = (msg->gbr_dl > 0 &&
-                          ctx->dl_color_gate_shaped_pipe != NULL);
-        struct doca_flow_fwd dl_fwd = {
-            .type = DOCA_FLOW_FWD_PIPE,
-            .next_pipe = dl_is_gbr ? ctx->dl_color_gate_shaped_pipe
-                                   : ctx->dl_color_gate_policed_pipe,
-        };
+        /* Fwd: pipe fwd is fixed to DL_ENCAP, no per-entry fwd needed */
 
         struct doca_flow_pipe_entry *dl_entry;
         result = doca_flow_pipe_basic_add_entry(0, ctx->dl_match_pipes[bucket],
-                                           &dl_match, 0, &dl_actions,
-                                           dl_mon_ptr, &dl_fwd,
+                                           &dl_match, 0, NULL,
+                                           NULL, NULL,
                                            0, NULL, &dl_entry);
         if (result != DOCA_SUCCESS) {
             DOCA_LOG_ERR("DL_MATCH entry failed hw_rule_id=%u bucket=%d: %s",
@@ -1345,7 +1301,7 @@ dpu_pipeline_insert_rule(dpu_pipeline_ctx_t *ctx, const hw_offload_msg_t *msg)
         rec->direction    = HW_DIR_DOWNLINK;
         rec->current_mode = DPU_MODE_FAST;
         rec->meter_id     = meter_id;
-        rec->is_gbr_flow  = dl_is_gbr;
+        rec->is_gbr_flow  = false;  /* bringup: no GBR distinction */
 
         /* DL_ENCAP entry: pkt_meta tag for this rule (no encap for bringup) */
         if (msg->ohc_desc == HW_OHC_GTPU_UDP_IPV4) {
@@ -1381,7 +1337,7 @@ dpu_pipeline_insert_rule(dpu_pipeline_ctx_t *ctx, const hw_offload_msg_t *msg)
                       "bucket=P%d meter=%s gbr=%s",
                       msg->hw_rule_id, msg->ue_ipv4.s_addr, msg->ohc_teid,
                       bucket, (meter_id != NO_METER_ID) ? "yes" : "none",
-                      dl_is_gbr ? "shaped" : "policed");
+                      "n/a(bringup)");
     }
 
     ctx->nb_entries++;
