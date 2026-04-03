@@ -495,14 +495,16 @@ build_ul_match_pipes(dpu_pipeline_ctx_t *ctx)
         doca_flow_pipe_cfg_set_is_root(pipe_cfg, false);
         doca_flow_pipe_cfg_set_nr_entries(pipe_cfg, 64);
 
-        /* Match: tun.type only (BRINGUP) — FW 32.43.2402 doesn't support
-         * GTP TEID/QFI/inner field extraction in HWS FDB mode.
-         * TODO: restore teid + qfi + UE IP match after FW upgrade. */
+        /* Match: TEID (BRINGUP step 1).
+         * QFI + inner fields still stripped — restore incrementally.
+         * TODO: restore qfi + UE IP match after confirming TEID works. */
         struct doca_flow_match match = {};
         match.tun.type = DOCA_FLOW_TUN_GTPU;
+        match.tun.gtp_teid = UINT32_MAX;
 
         struct doca_flow_match mask = {};
         mask.tun.type = DOCA_FLOW_TUN_GTPU;
+        mask.tun.gtp_teid = UINT32_MAX;
 
         doca_flow_pipe_cfg_set_match(pipe_cfg, &match, &mask);
 
@@ -1169,9 +1171,10 @@ dpu_pipeline_insert_rule(dpu_pipeline_ctx_t *ctx, const hw_offload_msg_t *msg)
                                      msg->gbr_ul, msg->mbr_ul);
         if (result != DOCA_SUCCESS) return result;
 
-        /* Match: tun.type only (bringup — TEID/QFI/inner stripped). */
+        /* Match: TEID (bringup step 1 — QFI/inner still stripped). */
         struct doca_flow_match match = {};
         match.tun.type = DOCA_FLOW_TUN_GTPU;
+        match.tun.gtp_teid = htonl(msg->teid);
 
         /* Actions: NONE for bringup (no pkt_meta, no meter on pipe) */
 
