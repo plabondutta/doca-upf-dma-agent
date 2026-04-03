@@ -1071,8 +1071,7 @@ main(int argc, char *argv[])
      * find port 0's Rx queues, and set_dev_rep(g_vf_rep) find port 1. */
     dev_result = doca_dpdk_port_probe_with_representors(
                      g_n3_dev,
-                     "dv_flow_en=2,fdb_def_rule_en=0,"
-                     "repr_matching_en=0,dv_xmeta_en=4",
+                     "dv_flow_en=2,fdb_def_rule_en=0,dv_xmeta_en=4",
                      &g_vf_rep, 1);
     if (dev_result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to probe N3 + host rep: %s",
