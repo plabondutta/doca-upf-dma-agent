@@ -949,9 +949,11 @@ create_trtcm_meter(struct doca_flow_port *port,
  * ═══════════════════════════════════════════════════════════════════════ */
 
 doca_error_t
-dpu_pipeline_init(dpu_pipeline_ctx_t *ctx, const dpu_port_cfg_t *port_cfg,
-                  uint16_t *rss_queues, uint32_t nr_rss_queues,
-                  uint16_t *shaper_rss_queues, uint32_t nr_shaper_rss_queues)
+dpu_pipeline_create_ports(dpu_pipeline_ctx_t *ctx,
+                          const dpu_port_cfg_t *port_cfg,
+                          uint16_t *rss_queues, uint32_t nr_rss_queues,
+                          uint16_t *shaper_rss_queues,
+                          uint32_t nr_shaper_rss_queues)
 {
     doca_error_t result;
 
@@ -1006,6 +1008,18 @@ dpu_pipeline_init(dpu_pipeline_ctx_t *ctx, const dpu_port_cfg_t *port_cfg,
     /* In switch mode, port pairing is NOT used.  Forwarding between ports
      * is done via DOCA_FLOW_FWD_PORT with fwd.port_id.  Calling
      * doca_flow_port_pair() in switch mode causes a segfault. */
+
+    DOCA_LOG_INFO("DOCA Flow ports created: %u ports (N3=%u, N6=%u, host=%u)",
+                  ctx->nb_ports, port_cfg->n3_port_id,
+                  port_cfg->n6_port_id, port_cfg->host_vf_port_id);
+    return DOCA_SUCCESS;
+}
+
+doca_error_t
+dpu_pipeline_build_pipes(dpu_pipeline_ctx_t *ctx)
+{
+    doca_error_t result;
+    const dpu_port_cfg_t *port_cfg = &ctx->port_cfg;
 
     /* Build pipes in dependency order */
     uint32_t pipe_count = 13;

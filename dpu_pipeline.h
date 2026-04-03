@@ -188,7 +188,9 @@ typedef struct {
  * ═══════════════════════════════════════════════════════════════════════ */
 
 /**
- * Initialise DOCA Flow in switch,hws mode and create the 14-pipe hierarchy.
+ * Phase 1: Init DOCA Flow, create ports, get switch port handle.
+ * After this returns, the caller MUST configure DPDK Rx/Tx queues on the
+ * proxy port (port 0) before calling dpu_pipeline_build_pipes().
  *
  * @param ctx             Pipeline context (caller-allocated, zero-initialised)
  * @param port_cfg        Port configuration (port IDs, MACs, IPs)
@@ -198,12 +200,21 @@ typedef struct {
  * @param nr_shaper_rss_queues  Number of shaper RSS queues (0 to disable shaping)
  * @return                      DOCA_SUCCESS on success
  */
-doca_error_t dpu_pipeline_init(dpu_pipeline_ctx_t *ctx,
-                               const dpu_port_cfg_t *port_cfg,
-                               uint16_t *rss_queues,
-                               uint32_t nr_rss_queues,
-                               uint16_t *shaper_rss_queues,
-                               uint32_t nr_shaper_rss_queues);
+doca_error_t dpu_pipeline_create_ports(dpu_pipeline_ctx_t *ctx,
+                                       const dpu_port_cfg_t *port_cfg,
+                                       uint16_t *rss_queues,
+                                       uint32_t nr_rss_queues,
+                                       uint16_t *shaper_rss_queues,
+                                       uint32_t nr_shaper_rss_queues);
+
+/**
+ * Phase 2: Build the pipe hierarchy.  Must be called after proxy port
+ * Rx/Tx queues are configured and the port is started.
+ *
+ * @param ctx  Pipeline context (ports must already be created)
+ * @return     DOCA_SUCCESS on success
+ */
+doca_error_t dpu_pipeline_build_pipes(dpu_pipeline_ctx_t *ctx);
 
 /**
  * Insert a PDR rule into the pipeline based on an hw_offload_msg.
