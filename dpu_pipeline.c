@@ -299,6 +299,7 @@ static doca_error_t
 build_color_gate_policed_pipe(dpu_pipeline_ctx_t *ctx,
                               const char *name,
                               uint16_t fwd_port_id,
+                              struct doca_flow_pipe *fwd_pipe,
                               struct doca_flow_pipe **pipe_out)
 {
     doca_error_t result;
@@ -324,10 +325,14 @@ build_color_gate_policed_pipe(dpu_pipeline_ctx_t *ctx,
     struct doca_flow_actions *actions_arr[] = { &actions };
     doca_flow_pipe_cfg_set_actions(pipe_cfg, actions_arr, NULL, NULL, 1);
 
-    struct doca_flow_fwd fwd = {
-        .type = DOCA_FLOW_FWD_PORT,
-        .port_id = fwd_port_id,
-    };
+    struct doca_flow_fwd fwd = {};
+    if (fwd_pipe) {
+        fwd.type = DOCA_FLOW_FWD_PIPE;
+        fwd.next_pipe = fwd_pipe;
+    } else {
+        fwd.type = DOCA_FLOW_FWD_PORT;
+        fwd.port_id = fwd_port_id;
+    }
     struct doca_flow_fwd fwd_miss = {
         .type = DOCA_FLOW_FWD_DROP,
     };
@@ -360,7 +365,8 @@ build_color_gate_policed_pipe(dpu_pipeline_ctx_t *ctx,
     }
 
     doca_flow_entries_process(ctx->switch_port, 0, 0, 0);
-    DOCA_LOG_INFO("%s: GREEN+YELLOW→wire, RED→drop (POLICED)", name);
+    DOCA_LOG_INFO("%s: GREEN+YELLOW→%s, RED→drop (POLICED)",
+                  name, fwd_pipe ? "pipe" : "wire");
     return DOCA_SUCCESS;
 }
 
@@ -375,6 +381,7 @@ static doca_error_t
 build_color_gate_shaped_pipe(dpu_pipeline_ctx_t *ctx,
                              const char *name,
                              uint16_t fwd_port_id,
+                             struct doca_flow_pipe *fwd_pipe,
                              uint16_t *rss_queues,
                              uint32_t nr_rss_queues,
                              struct doca_flow_pipe **pipe_out)
@@ -417,11 +424,15 @@ build_color_gate_shaped_pipe(dpu_pipeline_ctx_t *ctx,
 
     struct doca_flow_pipe_entry *entry;
 
-    /* GREEN → wire port */
-    struct doca_flow_fwd fwd_wire = {
-        .type = DOCA_FLOW_FWD_PORT,
-        .port_id = fwd_port_id,
-    };
+    /* GREEN → wire port or pipe (if fwd_pipe provided) */
+    struct doca_flow_fwd fwd_wire = {};
+    if (fwd_pipe) {
+        fwd_wire.type = DOCA_FLOW_FWD_PIPE;
+        fwd_wire.next_pipe = fwd_pipe;
+    } else {
+        fwd_wire.type = DOCA_FLOW_FWD_PORT;
+        fwd_wire.port_id = fwd_port_id;
+    }
     struct doca_flow_match green = {};
     green.parser_meta.meter_color = DOCA_FLOW_METER_COLOR_GREEN;
     result = doca_flow_pipe_basic_add_entry(0, *pipe_out,
@@ -453,8 +464,8 @@ build_color_gate_shaped_pipe(dpu_pipeline_ctx_t *ctx,
     }
 
     doca_flow_entries_process(ctx->switch_port, 0, 0, 0);
-    DOCA_LOG_INFO("%s: GREEN→wire, YELLOW→ARM RSS(%u queues), RED→drop (SHAPED)",
-                  name, nr_rss_queues);
+    DOCA_LOG_INFO("%s: GREEN→%s, YELLOW→ARM RSS(%u queues), RED→drop (SHAPED)",
+                  name, fwd_pipe ? "pipe" : "wire", nr_rss_queues);
     return DOCA_SUCCESS;
 }
 
@@ -504,17 +515,12 @@ build_ul_match_pipes(dpu_pipeline_ctx_t *ctx)
 
         doca_flow_pipe_cfg_set_match(pipe_cfg, &match, &mask);
 
-        /* Actions: decap + L2 inject + pkt_meta */
+        /* Actions: pkt_meta only.
+         * GTP decap is split into a separate UL_DECAP pipe to stay
+         * within the BF3 ARGUMENT_64B hardware descriptor limit.
+         * REFORMAT + pkt_meta + meter + changeable fwd exceeded 64B
+         * when combined in one pipe. */
         struct doca_flow_actions actions = {};
-        actions.decap_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED;
-        actions.decap_cfg.is_l2 = false;
-
-        memcpy(actions.decap_cfg.eth.src_mac,
-               ctx->port_cfg.upf_n6_mac, 6);
-        memcpy(actions.decap_cfg.eth.dst_mac,
-               ctx->port_cfg.dn_gw_mac, 6);
-        actions.decap_cfg.eth.type = RTE_BE16(0x0800);
-
         actions.meta.pkt_meta = UINT32_MAX;  /* changeable per-entry */
 
         struct doca_flow_actions *actions_arr[] = { &actions };
@@ -645,7 +651,114 @@ build_dl_match_pipes(dpu_pipeline_ctx_t *ctx)
 }
 
 
-/* ── DL_ENCAP pipe (EGRESS on N3 port) ─────────────────────────────── */
+/* ── UL_DECAP pipe (FDB domain) ────────────────────────────────────── */
+/*
+ * Splits GTP-U decapsulation out of UL_MATCH into a dedicated pipe.
+ *
+ * WHY: The BF3 eSwitch allocates exactly 64 bytes per FDB rule for
+ * dynamic action arguments (ARGUMENT_64B).  UL_MATCH needs:
+ *   - changeable pkt_meta (4B)
+ *   - shared meter ID (4B)
+ *   - changeable fwd handle (~32B)
+ * Adding REFORMAT (decap + L2 inject) on top exceeds 64B, causing
+ * "cannot get resource(ARGUMENT_64B)" at pipe creation.
+ *
+ * By moving the decap+L2 inject to a separate pipe, each pipe's action
+ * template stays within the 64-byte limit:
+ *   - UL_MATCH:  pkt_meta + meter + changeable fwd  (fits in 64B)
+ *   - UL_DECAP:  REFORMAT only                      (fits in 64B)
+ *
+ * This pipe matches all GTP-U traffic entering it (single catch-all
+ * entry) and applies a static decap with L2 header injection.
+ * UL color gates and ROOT UL reinject forward here instead of
+ * directly to N6 port.
+ *
+ * Data-plane path after split:
+ *   UL_MATCH → meter+meta → UL_COLOR_GATE → UL_DECAP → decap → N6 wire
+ *   Reinject: ROOT prio2 → UL_DECAP → decap → N6 wire
+ */
+static doca_error_t
+build_ul_decap_pipe(dpu_pipeline_ctx_t *ctx)
+{
+    doca_error_t result;
+    struct doca_flow_pipe_cfg *pipe_cfg;
+
+    result = doca_flow_pipe_cfg_create(&pipe_cfg, ctx->switch_port);
+    if (result != DOCA_SUCCESS) return result;
+
+    doca_flow_pipe_cfg_set_name(pipe_cfg, "UL_DECAP");
+    doca_flow_pipe_cfg_set_type(pipe_cfg, DOCA_FLOW_PIPE_BASIC);
+    doca_flow_pipe_cfg_set_is_root(pipe_cfg, false);
+    doca_flow_pipe_cfg_set_nr_entries(pipe_cfg, 1);
+
+    /* Match: GTP-U tunnel type — always true for traffic entering this pipe,
+     * since only UL color gates and UL reinject forward here. */
+    struct doca_flow_match match = {};
+    match.tun.type = DOCA_FLOW_TUN_GTPU;
+
+    struct doca_flow_match mask = {};
+    mask.tun.type = DOCA_FLOW_TUN_GTPU;
+
+    doca_flow_pipe_cfg_set_match(pipe_cfg, &match, &mask);
+
+    /* Actions: GTP decap + L2 header injection (static).
+     * is_l2=false → inner packet is L3 (no MAC inside GTP) → inject new L2.
+     * src_mac = UPF N6 MAC, dst_mac = DN gateway MAC, type = 0x0800 (IPv4). */
+    struct doca_flow_actions actions = {};
+    actions.decap_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED;
+    actions.decap_cfg.is_l2 = false;
+
+    memcpy(actions.decap_cfg.eth.src_mac,
+           ctx->port_cfg.upf_n6_mac, 6);
+    memcpy(actions.decap_cfg.eth.dst_mac,
+           ctx->port_cfg.dn_gw_mac, 6);
+    actions.decap_cfg.eth.type = RTE_BE16(0x0800);
+
+    struct doca_flow_actions *actions_arr[] = { &actions };
+    doca_flow_pipe_cfg_set_actions(pipe_cfg, actions_arr, NULL, NULL, 1);
+
+    /* Forward: out the N6 port */
+    struct doca_flow_fwd fwd = {
+        .type = DOCA_FLOW_FWD_PORT,
+        .port_id = ctx->port_cfg.n6_port_id,
+    };
+
+    /* Miss → DROP (safety net; should never be hit) */
+    struct doca_flow_fwd fwd_miss = {
+        .type = DOCA_FLOW_FWD_DROP,
+    };
+
+    result = doca_flow_pipe_create(pipe_cfg, &fwd, &fwd_miss,
+                                    &ctx->ul_decap_pipe);
+    doca_flow_pipe_cfg_destroy(pipe_cfg);
+
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("UL_DECAP pipe creation failed: %s",
+                     doca_error_get_descr(result));
+        return result;
+    }
+
+    /* Single catch-all entry: all GTP-U traffic gets decapped */
+    struct doca_flow_match entry_match = {};
+    entry_match.tun.type = DOCA_FLOW_TUN_GTPU;
+
+    struct doca_flow_pipe_entry *entry;
+    result = doca_flow_pipe_basic_add_entry(0, ctx->ul_decap_pipe,
+                                       &entry_match, 0, &actions, NULL, NULL,
+                                       0, NULL, &entry);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("UL_DECAP: catch-all entry failed: %s",
+                     doca_error_get_descr(result));
+        return result;
+    }
+
+    doca_flow_entries_process(ctx->switch_port, 0, 0, 0);
+    DOCA_LOG_INFO("UL_DECAP: GTP decap + L2 inject → N6 (1 entry)");
+    return DOCA_SUCCESS;
+}
+
+
+/* ── DL_ENCAP pipe (FDB domain) ────────────────────────────────────── */
 static doca_error_t
 build_dl_encap_pipe(dpu_pipeline_ctx_t *ctx)
 {
@@ -657,8 +770,7 @@ build_dl_encap_pipe(dpu_pipeline_ctx_t *ctx)
 
     doca_flow_pipe_cfg_set_name(pipe_cfg, "DL_ENCAP");
     doca_flow_pipe_cfg_set_type(pipe_cfg, DOCA_FLOW_PIPE_BASIC);
-    doca_flow_pipe_cfg_set_is_root(pipe_cfg, true);
-    doca_flow_pipe_cfg_set_domain(pipe_cfg, DOCA_FLOW_PIPE_DOMAIN_EGRESS);
+    doca_flow_pipe_cfg_set_is_root(pipe_cfg, false);
     doca_flow_pipe_cfg_set_nr_entries(pipe_cfg, 2048);
 
     /* Match pkt_meta (changeable) — mask ignores reinject bits 0-1
@@ -701,7 +813,7 @@ build_dl_encap_pipe(dpu_pipeline_ctx_t *ctx)
     struct doca_flow_actions *actions_arr[] = { &actions };
     doca_flow_pipe_cfg_set_actions(pipe_cfg, actions_arr, NULL, NULL, 1);
 
-    /* Forward: out the pipe (egress on N3) */
+    /* Forward: encap then out N3 wire */
     struct doca_flow_fwd fwd = {
         .type = DOCA_FLOW_FWD_PORT,
         .port_id = ctx->port_cfg.n3_port_id,
@@ -820,7 +932,7 @@ build_root_pipe(dpu_pipeline_ctx_t *ctx)
      * so bits 0-1 are 00 and neither reinject entry matches. */
 
     if (ctx->to_dpu_arm_pipe != NULL) {
-        /* Priority 2: pkt_meta bits 0-1 == 0x03 → N6 (UL reinject) */
+        /* Priority 2: pkt_meta bits 0-1 == 0x03 → UL_DECAP (UL reinject) */
         {
             struct doca_flow_match rmatch = {};
             rmatch.meta.pkt_meta = REINJECT_MARKER_BIT | REINJECT_UL_DIR_BIT;
@@ -829,8 +941,8 @@ build_root_pipe(dpu_pipeline_ctx_t *ctx)
             rmask.meta.pkt_meta = REINJECT_BITS_MASK;
 
             struct doca_flow_fwd rfwd = {
-                .type = DOCA_FLOW_FWD_PORT,
-                .port_id = ctx->port_cfg.n6_port_id,
+                .type = DOCA_FLOW_FWD_PIPE,
+                .next_pipe = ctx->ul_decap_pipe,
             };
 
             struct doca_flow_pipe_entry *rentry;
@@ -844,10 +956,10 @@ build_root_pipe(dpu_pipeline_ctx_t *ctx)
                              doca_error_get_descr(result));
                 return result;
             }
-            DOCA_LOG_INFO("ROOT: prio 2 — pkt_meta & 0x03 == 0x03 → N6 (UL reinject)");
+            DOCA_LOG_INFO("ROOT: prio 2 — pkt_meta & 0x03 == 0x03 → UL_DECAP (UL reinject)");
         }
 
-        /* Priority 3: pkt_meta bits 0-1 == 0x01 → N3 (DL reinject) */
+        /* Priority 3: pkt_meta bits 0-1 == 0x01 → DL_ENCAP (DL reinject) */
         {
             struct doca_flow_match rmatch = {};
             rmatch.meta.pkt_meta = REINJECT_MARKER_BIT;
@@ -856,8 +968,8 @@ build_root_pipe(dpu_pipeline_ctx_t *ctx)
             rmask.meta.pkt_meta = REINJECT_BITS_MASK;
 
             struct doca_flow_fwd rfwd = {
-                .type = DOCA_FLOW_FWD_PORT,
-                .port_id = ctx->port_cfg.n3_port_id,
+                .type = DOCA_FLOW_FWD_PIPE,
+                .next_pipe = ctx->dl_encap_pipe,
             };
 
             struct doca_flow_pipe_entry *rentry;
@@ -871,7 +983,7 @@ build_root_pipe(dpu_pipeline_ctx_t *ctx)
                              doca_error_get_descr(result));
                 return result;
             }
-            DOCA_LOG_INFO("ROOT: prio 3 — pkt_meta & 0x03 == 0x01 → N3 (DL reinject)");
+            DOCA_LOG_INFO("ROOT: prio 3 — pkt_meta & 0x03 == 0x01 → DL_ENCAP (DL reinject)");
         }
 
         doca_flow_entries_process(ctx->switch_port, 0, 0, 0);
@@ -1024,7 +1136,7 @@ dpu_pipeline_build_pipes(dpu_pipeline_ctx_t *ctx)
     const dpu_port_cfg_t *port_cfg = &ctx->port_cfg;
 
     /* Build pipes in dependency order */
-    uint32_t pipe_count = 13;
+    uint32_t pipe_count = 14;  /* base: TO_HOST + UL_DECAP + DL_ENCAP + UL/DL POLICED + UL/DL MATCH(4+4) + ROOT */
     if (ctx->nr_rss_queues > 0) pipe_count++;       /* TO_DPU_ARM */
     if (ctx->nr_shaper_rss_queues > 0) pipe_count += 2; /* UL+DL shaped gates */
     DOCA_LOG_INFO("Building %u-pipe hierarchy...", pipe_count);
@@ -1039,21 +1151,35 @@ dpu_pipeline_build_pipes(dpu_pipeline_ctx_t *ctx)
         if (result != DOCA_SUCCESS) return result;
     }
 
-    /* POLICED color gates: GREEN+YELLOW → wire, RED → DROP (MBR-only flows) */
+    /* UL_DECAP: built before color gates so color gates can forward to it.
+     * Splits GTP decap out of UL_MATCH to avoid ARGUMENT_64B overflow. */
+    result = build_ul_decap_pipe(ctx);
+    if (result != DOCA_SUCCESS) return result;
+
+    /* DL_ENCAP: built before color gates so DL color gates can forward to it.
+     * FDB domain (not EGRESS) — without port pairing, FWD_PORT from FDB
+     * doesn't trigger EGRESS pipes.  Explicit FWD_PIPE routing instead. */
+    result = build_dl_encap_pipe(ctx);
+    if (result != DOCA_SUCCESS) return result;
+
+    /* POLICED color gates: GREEN+YELLOW → pipe (UL_DECAP/DL_ENCAP), RED → DROP */
     result = build_color_gate_policed_pipe(ctx, "UL_COLOR_GATE_POLICED",
                                            port_cfg->n6_port_id,
+                                           ctx->ul_decap_pipe,
                                            &ctx->ul_color_gate_policed_pipe);
     if (result != DOCA_SUCCESS) return result;
 
     result = build_color_gate_policed_pipe(ctx, "DL_COLOR_GATE_POLICED",
                                            port_cfg->n3_port_id,
+                                           ctx->dl_encap_pipe,
                                            &ctx->dl_color_gate_policed_pipe);
     if (result != DOCA_SUCCESS) return result;
 
-    /* SHAPED color gates: GREEN → wire, YELLOW → ARM RSS, RED → DROP (GBR flows) */
+    /* SHAPED color gates: GREEN → pipe, YELLOW → ARM RSS, RED → DROP (GBR flows) */
     if (ctx->nr_shaper_rss_queues > 0) {
         result = build_color_gate_shaped_pipe(ctx, "UL_COLOR_GATE_SHAPED",
                                               port_cfg->n6_port_id,
+                                              ctx->ul_decap_pipe,
                                               ctx->shaper_rss_queues,
                                               ctx->nr_shaper_rss_queues,
                                               &ctx->ul_color_gate_shaped_pipe);
@@ -1061,6 +1187,7 @@ dpu_pipeline_build_pipes(dpu_pipeline_ctx_t *ctx)
 
         result = build_color_gate_shaped_pipe(ctx, "DL_COLOR_GATE_SHAPED",
                                               port_cfg->n3_port_id,
+                                              ctx->dl_encap_pipe,
                                               ctx->shaper_rss_queues,
                                               ctx->nr_shaper_rss_queues,
                                               &ctx->dl_color_gate_shaped_pipe);
@@ -1071,9 +1198,6 @@ dpu_pipeline_build_pipes(dpu_pipeline_ctx_t *ctx)
     if (result != DOCA_SUCCESS) return result;
 
     result = build_dl_match_pipes(ctx);
-    if (result != DOCA_SUCCESS) return result;
-
-    result = build_dl_encap_pipe(ctx);
     if (result != DOCA_SUCCESS) return result;
 
     result = build_root_pipe(ctx);
@@ -1141,7 +1265,7 @@ dpu_pipeline_insert_rule(dpu_pipeline_ctx_t *ctx, const hw_offload_msg_t *msg)
         match.inner.l3_type = DOCA_FLOW_L3_TYPE_IP4;
         match.inner.ip4.src_ip = msg->ue_ipv4.s_addr;  /* NBO */
 
-        /* Actions: pkt_meta (decap + L2 inject from pipe template) */
+        /* Actions: pkt_meta only (decap is in UL_DECAP pipe) */
         struct doca_flow_actions actions = {};
         actions.meta.pkt_meta = htonl(msg->hw_rule_id);
 
@@ -1942,6 +2066,8 @@ dpu_pipeline_destroy(dpu_pipeline_ctx_t *ctx)
         doca_flow_pipe_destroy(ctx->root_pipe);
     if (ctx->dl_encap_pipe)
         doca_flow_pipe_destroy(ctx->dl_encap_pipe);
+    if (ctx->ul_decap_pipe)
+        doca_flow_pipe_destroy(ctx->ul_decap_pipe);
 
     for (int p = 0; p < NUM_PRIO_BUCKETS; p++) {
         if (ctx->dl_match_pipes[p])

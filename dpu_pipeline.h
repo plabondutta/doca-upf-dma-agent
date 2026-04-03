@@ -1,17 +1,18 @@
 /*
  * dpu_pipeline.h — DOCA Flow pipeline for DPU Agent (switch,hws mode)
  *
- * 16-pipe hierarchy on BlueField-3 with priority-bucketed matching:
+ * 17-pipe hierarchy on BlueField-3 with priority-bucketed matching:
  *   ROOT                   → control pipe (is_root=true), steers by port_id+protocol
- *   UL_MATCH[0..3]         → basic pipes: TEID + QFI + inner 5-tuple (IPs + proto)
- *                             chained by precedence, decap + L2 inject + meter
- *   DL_MATCH[0..3]         → basic pipes: outer 5-tuple (UE IP + SDF IPs + proto)
+ *   UL_MATCH[0..3]         → basic pipes: TEID + QFI + inner src_ip
  *                             chained by precedence, set pkt_meta + meter
- *   UL_COLOR_GATE_POLICED  → basic pipe: GREEN+YELLOW → wire N6, RED → DROP
- *   DL_COLOR_GATE_POLICED  → basic pipe: GREEN+YELLOW → wire N3, RED → DROP
- *   UL_COLOR_GATE_SHAPED   → basic pipe: GREEN → wire N6, YELLOW → RSS ARM, RED → DROP
- *   DL_COLOR_GATE_SHAPED   → basic pipe: GREEN → wire N3, YELLOW → RSS ARM, RED → DROP
- *   DL_ENCAP               → basic pipe (EGRESS root): match pkt_meta → GTP encap + PSC
+ *   DL_MATCH[0..3]         → basic pipes: outer dst_ip (UE IP)
+ *                             chained by precedence, set pkt_meta + meter
+ *   UL_DECAP               → basic pipe: GTP decap + L2 inject → N6 wire
+ *   UL_COLOR_GATE_POLICED  → basic pipe: GREEN+YELLOW → UL_DECAP, RED → DROP
+ *   DL_COLOR_GATE_POLICED  → basic pipe: GREEN+YELLOW → DL_ENCAP, RED → DROP
+ *   UL_COLOR_GATE_SHAPED   → basic pipe: GREEN → UL_DECAP, YELLOW → RSS ARM, RED → DROP
+ *   DL_COLOR_GATE_SHAPED   → basic pipe: GREEN → DL_ENCAP, YELLOW → RSS ARM, RED → DROP
+ *   DL_ENCAP               → basic pipe: match pkt_meta → GTP encap + PSC → N3 wire
  *   TO_HOST                → basic pipe: catch-all → FWD to Host VF representor
  *   TO_DPU_ARM             → basic pipe: RSS → ARM Rx queues (for idle UE buffering)
  *
@@ -21,8 +22,8 @@
  *
  * Per-entry match_mask wildcards unused SDF fields for catch-all PDRs.
  *
- * Build order: TO_HOST → TO_DPU_ARM → POLICED gates → SHAPED gates
- *              → MATCH[3..0] → DL_ENCAP → ROOT
+ * Build order: TO_HOST → TO_DPU_ARM → UL_DECAP → DL_ENCAP → POLICED gates
+ *              → SHAPED gates → MATCH[3..0] → ROOT
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -161,6 +162,7 @@ typedef struct {
     struct doca_flow_pipe *dl_color_gate_policed_pipe;
     struct doca_flow_pipe *ul_color_gate_shaped_pipe;   /* GREEN → wire, YELLOW → ARM RSS */
     struct doca_flow_pipe *dl_color_gate_shaped_pipe;
+    struct doca_flow_pipe *ul_decap_pipe;               /* UL GTP decap + L2 inject */
     struct doca_flow_pipe *dl_encap_pipe;
     struct doca_flow_pipe *to_host_pipe;
     struct doca_flow_pipe *to_dpu_arm_pipe;
