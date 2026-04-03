@@ -1205,6 +1205,8 @@ dpu_pipeline_insert_rule(dpu_pipeline_ctx_t *ctx, const hw_offload_msg_t *msg)
         rec->meter_id     = meter_id;
         rec->is_gbr_flow  = ul_is_gbr;
 
+        doca_flow_entries_process(ctx->switch_port, 0, 0, 0);
+
         DOCA_LOG_INFO("UL rule: hw_rule=%u teid=0x%x qfi=%u bucket=P%d "
                       "meter=%s gbr=%s",
                       msg->hw_rule_id, msg->teid, msg->qfi, bucket,
