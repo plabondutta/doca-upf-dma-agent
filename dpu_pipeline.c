@@ -115,7 +115,7 @@ init_doca_flow(void)
     doca_flow_cfg_set_pipe_queues(cfg, 1);
     doca_flow_cfg_set_nr_counters(cfg, 4096);
     doca_flow_cfg_set_nr_meters(cfg, 4096);
-    doca_flow_cfg_set_mode_args(cfg, "switch,hws");
+    doca_flow_cfg_set_mode_args(cfg, "switch,isolated,hws");
     doca_flow_cfg_set_cb_entry_process(cfg, entry_process_cb);
     doca_flow_cfg_set_nr_shared_resource(cfg, 4096,
                                           DOCA_FLOW_SHARED_RESOURCE_METER);
@@ -144,16 +144,16 @@ create_port(uint16_t port_id,
 
     doca_flow_port_cfg_set_port_id(port_cfg, port_id);
 
-    /* Bind DOCA device — provides HW context for the port */
-    result = doca_flow_port_cfg_set_dev(port_cfg, dev);
-    if (result != DOCA_SUCCESS) {
-        doca_flow_port_cfg_destroy(port_cfg);
-        return result;
-    }
-
-    /* Bind representor if provided (e.g., Host VF) */
+    /* In DOCA 3.3, PF ports use set_dev() only; representor ports use
+     * set_dev_rep() only.  They are mutually exclusive on a port config. */
     if (dev_rep) {
         result = doca_flow_port_cfg_set_dev_rep(port_cfg, dev_rep);
+        if (result != DOCA_SUCCESS) {
+            doca_flow_port_cfg_destroy(port_cfg);
+            return result;
+        }
+    } else {
+        result = doca_flow_port_cfg_set_dev(port_cfg, dev);
         if (result != DOCA_SUCCESS) {
             doca_flow_port_cfg_destroy(port_cfg);
             return result;
@@ -1003,11 +1003,9 @@ dpu_pipeline_init(dpu_pipeline_ctx_t *ctx, const dpu_port_cfg_t *port_cfg,
         return DOCA_ERROR_INITIALIZATION;
     }
 
-    result = doca_flow_port_pair(ctx->ports[0], ctx->ports[1]);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Port pair failed: %s", doca_error_get_descr(result));
-        return result;
-    }
+    /* In switch mode, port pairing is NOT used.  Forwarding between ports
+     * is done via DOCA_FLOW_FWD_PORT with fwd.port_id.  Calling
+     * doca_flow_port_pair() in switch mode causes a segfault. */
 
     /* Build pipes in dependency order */
     uint32_t pipe_count = 13;

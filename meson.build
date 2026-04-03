@@ -25,6 +25,7 @@ doca_common_dep = dependency('doca-common', required: true)
 doca_flow_dep   = dependency('doca-flow',   required: true)
 doca_comch_dep  = dependency('doca-comch',  required: true)
 doca_argp_dep   = dependency('doca-argp',   required: true)
+doca_dpdk_bridge_dep = dependency('doca-dpdk-bridge', required: true)
 
 executable('dpu_agent',
     sources: files(
@@ -40,6 +41,7 @@ executable('dpu_agent',
         doca_flow_dep,
         doca_comch_dep,
         doca_argp_dep,
+        doca_dpdk_bridge_dep,
     ],
     install: true,
 )

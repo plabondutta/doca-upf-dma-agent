@@ -21,6 +21,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <limits.h>
 #include <string.h>
 #include <unistd.h>
 #include <arpa/inet.h>
@@ -70,6 +71,7 @@ static uint64_t g_rules_failed;
 static struct doca_dev *g_n3_dev;
 static struct doca_dev *g_n6_dev;
 static struct doca_dev *g_vf_dev;
+static struct doca_dev_rep *g_vf_rep;  /* host VF/PF representor for Flow port 2 */
 
 /* DPDK resources for ARM buffering */
 static struct rte_mempool *g_mbuf_pool;
@@ -431,6 +433,23 @@ comch_send_error_cb(struct doca_comch_task_send *task,
  *  DOCA Comch server init
  * ═══════════════════════════════════════════════════════════════════════ */
 
+/**
+ * Compare PCI addresses tolerating short (03:00.0) vs full (0000:03:00.0).
+ * If one string is shorter, compare against the tail of the longer one.
+ */
+static bool
+pci_addr_match(const char *a, const char *b)
+{
+    if (strcmp(a, b) == 0)
+        return true;
+    size_t la = strlen(a), lb = strlen(b);
+    if (la > lb)
+        return strcmp(a + (la - lb), b) == 0;
+    if (lb > la)
+        return strcmp(b + (lb - la), a) == 0;
+    return false;
+}
+
 /* Open device by PCI address */
 static doca_error_t
 open_doca_device_by_pci(const char *pci_addr, struct doca_dev **dev)
@@ -447,7 +466,7 @@ open_doca_device_by_pci(const char *pci_addr, struct doca_dev **dev)
         result = doca_devinfo_get_pci_addr_str(dev_list[i], addr_buf);
         if (result != DOCA_SUCCESS)
             continue;
-        if (strcmp(addr_buf, pci_addr) == 0) {
+        if (pci_addr_match(addr_buf, pci_addr)) {
             result = doca_dev_open(dev_list[i], dev);
             doca_devinfo_destroy_list(dev_list);
             return result;
@@ -480,7 +499,7 @@ open_doca_device_rep_by_pci(struct doca_dev *dev, const char *rep_pci_addr,
         result = doca_devinfo_rep_get_pci_addr_str(rep_list[i], addr_buf);
         if (result != DOCA_SUCCESS)
             continue;
-        if (strcmp(addr_buf, rep_pci_addr) == 0) {
+        if (pci_addr_match(addr_buf, rep_pci_addr)) {
             result = doca_dev_rep_open(rep_list[i], rep_dev);
             doca_devinfo_rep_destroy_list(rep_list);
             return result;
@@ -801,6 +820,49 @@ finalize_config(dpu_agent_cfg_t *cfg)
     return 0;
 }
 
+static const char *
+get_json_path_arg(int argc, char *argv[])
+{
+    for (int i = 1; i < argc; i++) {
+        if ((strcmp(argv[i], "-j") == 0) ||
+            (strcmp(argv[i], "--json") == 0)) {
+            if (i + 1 < argc)
+                return argv[i + 1];
+            return "";
+        }
+        if (strncmp(argv[i], "-j=", 3) == 0)
+            return argv[i] + 3;
+        if (strncmp(argv[i], "--json=", 7) == 0)
+            return argv[i] + 7;
+    }
+    return NULL;
+}
+
+static int
+validate_json_path_arg(int argc, char *argv[])
+{
+    const char *json_path = get_json_path_arg(argc, argv);
+    if (json_path == NULL)
+        return 0;
+
+    if (json_path[0] == '\0') {
+        fprintf(stderr, "dpu_agent: --json/-j requires a path\n");
+        return -1;
+    }
+
+    if (access(json_path, R_OK) == 0)
+        return 0;
+
+    char cwd[PATH_MAX];
+    if (getcwd(cwd, sizeof(cwd)) == NULL)
+        snprintf(cwd, sizeof(cwd), "<unknown>");
+
+    fprintf(stderr,
+            "dpu_agent: cannot read JSON file '%s' (cwd: %s): %s\n",
+            json_path, cwd, strerror(errno));
+    return -1;
+}
+
 
 /* ═══════════════════════════════════════════════════════════════════════
  *  main
@@ -810,6 +872,31 @@ int
 main(int argc, char *argv[])
 {
     doca_error_t result;
+    struct doca_log_backend *sdk_log = NULL;
+
+    if (validate_json_path_arg(argc, argv) < 0)
+        return EXIT_FAILURE;
+
+    result = doca_log_backend_create_standard();
+    if (result != DOCA_SUCCESS) {
+        fprintf(stderr, "dpu_agent: failed to init log backend: %s\n",
+                doca_error_get_descr(result));
+        return EXIT_FAILURE;
+    }
+
+    result = doca_log_backend_create_with_file_sdk(stderr, &sdk_log);
+    if (result != DOCA_SUCCESS) {
+        fprintf(stderr, "dpu_agent: failed to init SDK log backend: %s\n",
+                doca_error_get_descr(result));
+        return EXIT_FAILURE;
+    }
+
+    result = doca_log_backend_set_sdk_level(sdk_log, DOCA_LOG_LEVEL_WARNING);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("failed to set SDK log level: %s",
+                     doca_error_get_descr(result));
+        return EXIT_FAILURE;
+    }
 
     signal(SIGINT,  signal_handler);
     signal(SIGTERM, signal_handler);
@@ -835,6 +922,7 @@ main(int argc, char *argv[])
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("doca_argp_start failed: %s",
                      doca_error_get_descr(result));
+        DOCA_LOG_ERR("If using -j/--json, ensure the path is relative to current cwd");
         doca_argp_destroy();
         return EXIT_FAILURE;
     }
@@ -861,7 +949,9 @@ main(int argc, char *argv[])
         doca_argp_destroy();
         return EXIT_FAILURE;
     }
-    /* VF device: open by PCI if specified, else use N3 device */
+    /* VF device: open by PCI if specified, else use N3 device as parent.
+     * In switch mode, port 2 (host VF) needs a representor device — it
+     * shares the parent PF dev but gets its own queue mapping via the rep. */
     if (g_cfg.vf_pci[0] != '\0') {
         dev_result = open_doca_device_by_pci(g_cfg.vf_pci, &g_vf_dev);
         if (dev_result != DOCA_SUCCESS) {
@@ -871,7 +961,17 @@ main(int argc, char *argv[])
             return EXIT_FAILURE;
         }
     } else {
-        g_vf_dev = g_n3_dev;  /* fallback: same device as N3 */
+        g_vf_dev = g_n3_dev;  /* parent PF — port 2 uses representor */
+    }
+    /* Open the host PF/VF representor for Flow port 2.
+     * This provides DOCA Flow with a separate queue mapping context
+     * even when the parent dev is shared with port 0 (N3). */
+    dev_result = open_doca_device_rep_by_pci(g_vf_dev, g_cfg.rep_pci, &g_vf_rep);
+    if (dev_result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Cannot open host representor %s for Flow port 2: %s",
+                     g_cfg.rep_pci, doca_error_get_descr(dev_result));
+        doca_argp_destroy();
+        return EXIT_FAILURE;
     }
 
     /* ── Comch server ──────────────────────────────────────────────── */
@@ -889,7 +989,7 @@ main(int argc, char *argv[])
     port_cfg.n3_dev          = g_n3_dev;
     port_cfg.n6_dev          = g_n6_dev;
     port_cfg.host_vf_dev     = g_vf_dev;
-    port_cfg.host_vf_rep     = NULL;  /* set by caller if probing representors */
+    port_cfg.host_vf_rep     = g_vf_rep;
     port_cfg.upf_n3_ip       = g_cfg.upf_n3_ip;
     memcpy(port_cfg.upf_n6_mac, g_cfg.upf_n6_mac, 6);
     memcpy(port_cfg.dn_gw_mac,  g_cfg.dn_gw_mac,  6);
@@ -988,6 +1088,8 @@ main(int argc, char *argv[])
     rte_eth_dev_stop(g_proxy_port_id);
 
     /* Close port devices (VF may alias N3, only close if distinct) */
+    if (g_vf_rep)
+        doca_dev_rep_close(g_vf_rep);
     if (g_vf_dev && g_vf_dev != g_n3_dev)
         doca_dev_close(g_vf_dev);
     if (g_n6_dev)
