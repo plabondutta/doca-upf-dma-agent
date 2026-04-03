@@ -651,31 +651,28 @@ build_dl_match_pipes(dpu_pipeline_ctx_t *ctx)
 }
 
 
-/* ── UL_DECAP pipe (FDB domain) ────────────────────────────────────── */
+/* ── UL_DECAP pipe (EGRESS domain on N6 port) ─────────────────────── */
 /*
- * Splits GTP-U decapsulation out of UL_MATCH into a dedicated pipe.
+ * Splits GTP-U decapsulation out of UL_MATCH into a dedicated pipe
+ * in the EGRESS domain on the N6 port (ctx->ports[1]).
  *
- * WHY: The BF3 eSwitch allocates exactly 64 bytes per FDB rule for
- * dynamic action arguments (ARGUMENT_64B).  UL_MATCH needs:
- *   - changeable pkt_meta (4B)
- *   - shared meter ID (4B)
- *   - changeable fwd handle (~32B)
- * Adding REFORMAT (decap + L2 inject) on top exceeds 64B, causing
- * "cannot get resource(ARGUMENT_64B)" at pipe creation.
+ * WHY EGRESS: The BF3 FDB (eSwitch) domain does NOT provision
+ * ARGUMENT_64B resources at all — any REFORMAT action in FDB fails
+ * with "cannot get resource(ARGUMENT_64B)".  The EGRESS domain
+ * per-NIC-port has its own resource pool that includes REFORMAT.
  *
- * By moving the decap+L2 inject to a separate pipe, each pipe's action
- * template stays within the 64-byte limit:
- *   - UL_MATCH:  pkt_meta + meter + changeable fwd  (fits in 64B)
- *   - UL_DECAP:  REFORMAT only                      (fits in 64B)
+ * Architecture:
+ *   FDB color gates / ROOT reinject use FWD_PIPE to this EGRESS root.
+ *   DOCA docs: "forwarding from default domain to egress domain root
+ *   pipe is allowed" in switch mode.
  *
- * This pipe matches all GTP-U traffic entering it (single catch-all
- * entry) and applies a static decap with L2 header injection.
- * UL color gates and ROOT UL reinject forward here instead of
- * directly to N6 port.
+ * This pipe matches all GTP-U traffic and applies static decap + L2
+ * header injection.  Miss → pass-through to N6 wire (safety net for
+ * any non-GTP traffic that reaches N6 EGRESS).
  *
- * Data-plane path after split:
- *   UL_MATCH → meter+meta → UL_COLOR_GATE → UL_DECAP → decap → N6 wire
- *   Reinject: ROOT prio2 → UL_DECAP → decap → N6 wire
+ * Data-plane path:
+ *   UL_MATCH → meter+meta → UL_COLOR_GATE →(FWD_PIPE)→ UL_DECAP → decap → N6 wire
+ *   Reinject: ROOT prio2 →(FWD_PIPE)→ UL_DECAP → decap → N6 wire
  */
 static doca_error_t
 build_ul_decap_pipe(dpu_pipeline_ctx_t *ctx)
@@ -683,12 +680,13 @@ build_ul_decap_pipe(dpu_pipeline_ctx_t *ctx)
     doca_error_t result;
     struct doca_flow_pipe_cfg *pipe_cfg;
 
-    result = doca_flow_pipe_cfg_create(&pipe_cfg, ctx->switch_port);
+    result = doca_flow_pipe_cfg_create(&pipe_cfg, ctx->ports[1]);  /* N6 port */
     if (result != DOCA_SUCCESS) return result;
 
     doca_flow_pipe_cfg_set_name(pipe_cfg, "UL_DECAP");
     doca_flow_pipe_cfg_set_type(pipe_cfg, DOCA_FLOW_PIPE_BASIC);
-    doca_flow_pipe_cfg_set_is_root(pipe_cfg, false);
+    doca_flow_pipe_cfg_set_is_root(pipe_cfg, true);
+    doca_flow_pipe_cfg_set_domain(pipe_cfg, DOCA_FLOW_PIPE_DOMAIN_EGRESS);
     doca_flow_pipe_cfg_set_nr_entries(pipe_cfg, 1);
 
     /* Match: GTP-U tunnel type — always true for traffic entering this pipe,
@@ -723,9 +721,10 @@ build_ul_decap_pipe(dpu_pipeline_ctx_t *ctx)
         .port_id = ctx->port_cfg.n6_port_id,
     };
 
-    /* Miss → DROP (safety net; should never be hit) */
+    /* Miss → pass through to N6 wire (non-GTP traffic exits untouched) */
     struct doca_flow_fwd fwd_miss = {
-        .type = DOCA_FLOW_FWD_DROP,
+        .type = DOCA_FLOW_FWD_PORT,
+        .port_id = ctx->port_cfg.n6_port_id,
     };
 
     result = doca_flow_pipe_create(pipe_cfg, &fwd, &fwd_miss,
@@ -752,25 +751,31 @@ build_ul_decap_pipe(dpu_pipeline_ctx_t *ctx)
         return result;
     }
 
-    doca_flow_entries_process(ctx->switch_port, 0, 0, 0);
-    DOCA_LOG_INFO("UL_DECAP: GTP decap + L2 inject → N6 (1 entry)");
+    doca_flow_entries_process(ctx->ports[1], 0, 0, 0);  /* N6 port */
+    DOCA_LOG_INFO("UL_DECAP: EGRESS root on N6 — GTP decap + L2 inject (1 entry)");
     return DOCA_SUCCESS;
 }
 
 
-/* ── DL_ENCAP pipe (FDB domain) ────────────────────────────────────── */
+/* ── DL_ENCAP pipe (EGRESS domain on N3 port) ─────────────────────── */
+/*
+ * EGRESS root on N3 port (ctx->ports[0]).  Same rationale as UL_DECAP:
+ * FDB domain has NO ARGUMENT_64B resources for REFORMAT.
+ * FDB pipes use FWD_PIPE to route DL traffic into this EGRESS root.
+ */
 static doca_error_t
 build_dl_encap_pipe(dpu_pipeline_ctx_t *ctx)
 {
     doca_error_t result;
     struct doca_flow_pipe_cfg *pipe_cfg;
 
-    result = doca_flow_pipe_cfg_create(&pipe_cfg, ctx->switch_port);
+    result = doca_flow_pipe_cfg_create(&pipe_cfg, ctx->ports[0]);  /* N3 port */
     if (result != DOCA_SUCCESS) return result;
 
     doca_flow_pipe_cfg_set_name(pipe_cfg, "DL_ENCAP");
     doca_flow_pipe_cfg_set_type(pipe_cfg, DOCA_FLOW_PIPE_BASIC);
-    doca_flow_pipe_cfg_set_is_root(pipe_cfg, false);
+    doca_flow_pipe_cfg_set_is_root(pipe_cfg, true);
+    doca_flow_pipe_cfg_set_domain(pipe_cfg, DOCA_FLOW_PIPE_DOMAIN_EGRESS);
     doca_flow_pipe_cfg_set_nr_entries(pipe_cfg, 2048);
 
     /* Match pkt_meta (changeable) — mask ignores reinject bits 0-1
@@ -1151,14 +1156,15 @@ dpu_pipeline_build_pipes(dpu_pipeline_ctx_t *ctx)
         if (result != DOCA_SUCCESS) return result;
     }
 
-    /* UL_DECAP: built before color gates so color gates can forward to it.
-     * Splits GTP decap out of UL_MATCH to avoid ARGUMENT_64B overflow. */
+    /* UL_DECAP: EGRESS root on N6 port — built before color gates so
+     * UL color gates can FWD_PIPE to it.  Splits GTP decap out of UL_MATCH;
+     * FDB domain lacks ARGUMENT_64B resources for REFORMAT. */
     result = build_ul_decap_pipe(ctx);
     if (result != DOCA_SUCCESS) return result;
 
-    /* DL_ENCAP: built before color gates so DL color gates can forward to it.
-     * FDB domain (not EGRESS) — without port pairing, FWD_PORT from FDB
-     * doesn't trigger EGRESS pipes.  Explicit FWD_PIPE routing instead. */
+    /* DL_ENCAP: EGRESS root on N3 port — built before color gates so
+     * DL color gates can FWD_PIPE to it.  FDB domain lacks ARGUMENT_64B
+     * resources for REFORMAT, so encap must happen in EGRESS. */
     result = build_dl_encap_pipe(ctx);
     if (result != DOCA_SUCCESS) return result;
 
@@ -1458,7 +1464,8 @@ dpu_pipeline_insert_rule(dpu_pipeline_ctx_t *ctx, const hw_offload_msg_t *msg)
             rec->dl_encap_entry = encap_entry;
         }
 
-        doca_flow_entries_process(ctx->switch_port, 0, 0, 0);
+        doca_flow_entries_process(ctx->switch_port, 0, 0, 0);  /* DL_MATCH (FDB) */
+        doca_flow_entries_process(ctx->ports[0], 0, 0, 0);     /* DL_ENCAP (EGRESS on N3) */
 
         DOCA_LOG_INFO("DL rule: hw_rule=%u ue_ip=%08x ohc_teid=0x%x "
                       "bucket=P%d meter=%s gbr=%s",
@@ -1525,7 +1532,8 @@ dpu_pipeline_delete_rule(dpu_pipeline_ctx_t *ctx, uint32_t hw_rule_id)
         }
     }
 
-    doca_flow_entries_process(ctx->switch_port, 0, 0, 0);
+    doca_flow_entries_process(ctx->switch_port, 0, 0, 0);  /* FDB entries */
+    doca_flow_entries_process(ctx->ports[0], 0, 0, 0);     /* DL_ENCAP (EGRESS on N3) */
 
     /* If any entry removal failed, do NOT release meter or free record.
      * HW entries may still reference the meter — releasing it could cause
@@ -1723,7 +1731,7 @@ dpu_pipeline_update_far(dpu_pipeline_ctx_t *ctx, const hw_offload_msg_t *msg)
                              doca_error_get_descr(result));
                 return result;
             }
-            doca_flow_entries_process(ctx->switch_port, 0, 0, 0);
+            doca_flow_entries_process(ctx->ports[0], 0, 0, 0);  /* DL_ENCAP (EGRESS on N3) */
 
             DOCA_LOG_INFO("update_far: hw_rule_id=%u ENCAP updated "
                           "teid=0x%x dst_ip=%08x",
@@ -2014,7 +2022,7 @@ dpu_pipeline_update_dlencap_only(dpu_pipeline_ctx_t *ctx,
                      msg->hw_rule_id, doca_error_get_descr(result));
         return result;
     }
-    doca_flow_entries_process(ctx->switch_port, 0, 0, 0);
+    doca_flow_entries_process(ctx->ports[0], 0, 0, 0);  /* DL_ENCAP (EGRESS on N3) */
 
     DOCA_LOG_INFO("update_dlencap_only: hw_rule_id=%u ENCAP updated "
                   "teid=0x%x dst_ip=%08x qfi=%u (before drain)",

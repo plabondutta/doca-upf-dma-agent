@@ -7,12 +7,12 @@
  *                             chained by precedence, set pkt_meta + meter
  *   DL_MATCH[0..3]         → basic pipes: outer dst_ip (UE IP)
  *                             chained by precedence, set pkt_meta + meter
- *   UL_DECAP               → basic pipe: GTP decap + L2 inject → N6 wire
- *   UL_COLOR_GATE_POLICED  → basic pipe: GREEN+YELLOW → UL_DECAP, RED → DROP
- *   DL_COLOR_GATE_POLICED  → basic pipe: GREEN+YELLOW → DL_ENCAP, RED → DROP
- *   UL_COLOR_GATE_SHAPED   → basic pipe: GREEN → UL_DECAP, YELLOW → RSS ARM, RED → DROP
- *   DL_COLOR_GATE_SHAPED   → basic pipe: GREEN → DL_ENCAP, YELLOW → RSS ARM, RED → DROP
- *   DL_ENCAP               → basic pipe: match pkt_meta → GTP encap + PSC → N3 wire
+ *   UL_DECAP               → EGRESS root on N6: GTP decap + L2 inject → N6 wire
+ *   UL_COLOR_GATE_POLICED  → basic pipe: GREEN+YELLOW → FWD_PIPE(UL_DECAP), RED → DROP
+ *   DL_COLOR_GATE_POLICED  → basic pipe: GREEN+YELLOW → FWD_PIPE(DL_ENCAP), RED → DROP
+ *   UL_COLOR_GATE_SHAPED   → basic pipe: GREEN → FWD_PIPE(UL_DECAP), YELLOW → RSS ARM, RED → DROP
+ *   DL_COLOR_GATE_SHAPED   → basic pipe: GREEN → FWD_PIPE(DL_ENCAP), YELLOW → RSS ARM, RED → DROP
+ *   DL_ENCAP               → EGRESS root on N3: match pkt_meta → GTP encap + PSC → N3 wire
  *   TO_HOST                → basic pipe: catch-all → FWD to Host VF representor
  *   TO_DPU_ARM             → basic pipe: RSS → ARM Rx queues (for idle UE buffering)
  *
