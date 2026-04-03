@@ -656,10 +656,10 @@ dpdk_init_cb(int argc, char **argv)
 /**
  * Setup the switch proxy port for ARM-side buffering and shaping.
  *
- * Must be called AFTER dpu_pipeline_create_ports() returns, because DPDK
- * ethdev port 0 (the switch proxy port) only exists after
- * doca_flow_port_start().  Must be called BEFORE dpu_pipeline_build_pipes()
- * because RSS pipes need queues to exist.
+ * Must be called AFTER rte_eal_init() (DPDK port 0 exists from -a probe)
+ * but BEFORE dpu_pipeline_create_ports(), because doca_flow_port_start()
+ * snapshots the queue state — queues added after port_start are invisible
+ * to DOCA Flow RSS pipes.
  *
  * Creates mbuf pool, configures Rx/Tx queues on the proxy port, starts it,
  * and registers the dynamic metadata field used by reinject paths.
@@ -1008,26 +1008,25 @@ main(int argc, char *argv[])
     for (int q = 0; q < SHAPER_RX_QUEUES; q++)
         shaper_rss_queues[q] = (uint16_t)(BUFFER_RX_QUEUES + q);
 
+    /* ── Setup proxy port for ARM buffering/shaping ────────────────── *
+     * DPDK port 0 exists after EAL probe (-a flags).  We MUST configure
+     * Rx/Tx queues and start the port BEFORE doca_flow_port_start(),
+     * because port_start snapshots the queue state.  RSS pipes built
+     * later will only see queues that existed at port_start time.      */
+    result = setup_proxy_port();
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Proxy port setup failed: %s", doca_error_get_descr(result));
+        comch_server_destroy();
+        doca_argp_destroy();
+        return EXIT_FAILURE;
+    }
+
     result = dpu_pipeline_create_ports(&g_pipeline, &port_cfg,
                                        rss_queues, BUFFER_RX_QUEUES,
                                        shaper_rss_queues, SHAPER_RX_QUEUES);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Pipeline port creation failed: %s",
                      doca_error_get_descr(result));
-        comch_server_destroy();
-        doca_argp_destroy();
-        return EXIT_FAILURE;
-    }
-
-    /* ── Setup proxy port for ARM buffering/shaping ────────────────── *
-     * doca_flow_port_start() (inside create_ports) creates DPDK ethdev
-     * port 0 (the switch proxy port).  We MUST configure Rx/Tx queues
-     * and start the port BEFORE building pipes, because RSS pipes need
-     * queues to exist.                                                 */
-    result = setup_proxy_port();
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Proxy port setup failed: %s", doca_error_get_descr(result));
-        dpu_pipeline_destroy(&g_pipeline);
         comch_server_destroy();
         doca_argp_destroy();
         return EXIT_FAILURE;
