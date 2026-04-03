@@ -651,28 +651,10 @@ build_dl_match_pipes(dpu_pipeline_ctx_t *ctx)
 }
 
 
-/* ── UL_DECAP pipe (EGRESS domain on N6 port) ─────────────────────── */
+/* ── UL_DECAP pipe (FDB pass-through — REFORMAT disabled for bringup) ─ */
 /*
- * Splits GTP-U decapsulation out of UL_MATCH into a dedicated pipe
- * in the EGRESS domain on the N6 port (ctx->ports[1]).
- *
- * WHY EGRESS: The BF3 FDB (eSwitch) domain does NOT provision
- * ARGUMENT_64B resources at all — any REFORMAT action in FDB fails
- * with "cannot get resource(ARGUMENT_64B)".  The EGRESS domain
- * per-NIC-port has its own resource pool that includes REFORMAT.
- *
- * Architecture:
- *   FDB color gates / ROOT reinject use FWD_PIPE to this EGRESS root.
- *   DOCA docs: "forwarding from default domain to egress domain root
- *   pipe is allowed" in switch mode.
- *
- * This pipe matches all GTP-U traffic and applies static decap + L2
- * header injection.  Miss → pass-through to N6 wire (safety net for
- * any non-GTP traffic that reaches N6 EGRESS).
- *
- * Data-plane path:
- *   UL_MATCH → meter+meta → UL_COLOR_GATE →(FWD_PIPE)→ UL_DECAP → decap → N6 wire
- *   Reinject: ROOT prio2 →(FWD_PIPE)→ UL_DECAP → decap → N6 wire
+ * TEMPORARY: No decap action.  Just forwards UL traffic to N6.
+ * TODO: Re-enable GTP decap + L2 inject once ARGUMENT_64B is resolved.
  */
 static doca_error_t
 build_ul_decap_pipe(dpu_pipeline_ctx_t *ctx)
@@ -680,17 +662,15 @@ build_ul_decap_pipe(dpu_pipeline_ctx_t *ctx)
     doca_error_t result;
     struct doca_flow_pipe_cfg *pipe_cfg;
 
-    result = doca_flow_pipe_cfg_create(&pipe_cfg, ctx->ports[1]);  /* N6 port */
+    result = doca_flow_pipe_cfg_create(&pipe_cfg, ctx->switch_port);
     if (result != DOCA_SUCCESS) return result;
 
     doca_flow_pipe_cfg_set_name(pipe_cfg, "UL_DECAP");
     doca_flow_pipe_cfg_set_type(pipe_cfg, DOCA_FLOW_PIPE_BASIC);
-    doca_flow_pipe_cfg_set_is_root(pipe_cfg, true);
-    doca_flow_pipe_cfg_set_domain(pipe_cfg, DOCA_FLOW_PIPE_DOMAIN_EGRESS);
+    doca_flow_pipe_cfg_set_is_root(pipe_cfg, false);
     doca_flow_pipe_cfg_set_nr_entries(pipe_cfg, 1);
 
-    /* Match: GTP-U tunnel type — always true for traffic entering this pipe,
-     * since only UL color gates and UL reinject forward here. */
+    /* Match: GTP-U tunnel type (catch-all for UL traffic) */
     struct doca_flow_match match = {};
     match.tun.type = DOCA_FLOW_TUN_GTPU;
 
@@ -699,29 +679,14 @@ build_ul_decap_pipe(dpu_pipeline_ctx_t *ctx)
 
     doca_flow_pipe_cfg_set_match(pipe_cfg, &match, &mask);
 
-    /* Actions: GTP decap + L2 header injection (static).
-     * is_l2=false → inner packet is L3 (no MAC inside GTP) → inject new L2.
-     * src_mac = UPF N6 MAC, dst_mac = DN gateway MAC, type = 0x0800 (IPv4). */
-    struct doca_flow_actions actions = {};
-    actions.decap_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED;
-    actions.decap_cfg.is_l2 = false;
+    /* NO actions — pure pass-through (decap disabled for bringup) */
 
-    memcpy(actions.decap_cfg.eth.src_mac,
-           ctx->port_cfg.upf_n6_mac, 6);
-    memcpy(actions.decap_cfg.eth.dst_mac,
-           ctx->port_cfg.dn_gw_mac, 6);
-    actions.decap_cfg.eth.type = RTE_BE16(0x0800);
-
-    struct doca_flow_actions *actions_arr[] = { &actions };
-    doca_flow_pipe_cfg_set_actions(pipe_cfg, actions_arr, NULL, NULL, 1);
-
-    /* Forward: out the N6 port */
+    /* Forward: out the N6 port (still GTP-encapped, but pipeline runs) */
     struct doca_flow_fwd fwd = {
         .type = DOCA_FLOW_FWD_PORT,
         .port_id = ctx->port_cfg.n6_port_id,
     };
 
-    /* Miss → pass through to N6 wire (non-GTP traffic exits untouched) */
     struct doca_flow_fwd fwd_miss = {
         .type = DOCA_FLOW_FWD_PORT,
         .port_id = ctx->port_cfg.n6_port_id,
@@ -737,13 +702,13 @@ build_ul_decap_pipe(dpu_pipeline_ctx_t *ctx)
         return result;
     }
 
-    /* Single catch-all entry: all GTP-U traffic gets decapped */
+    /* Single catch-all entry */
     struct doca_flow_match entry_match = {};
     entry_match.tun.type = DOCA_FLOW_TUN_GTPU;
 
     struct doca_flow_pipe_entry *entry;
     result = doca_flow_pipe_basic_add_entry(0, ctx->ul_decap_pipe,
-                                       &entry_match, 0, &actions, NULL, NULL,
+                                       &entry_match, 0, NULL, NULL, NULL,
                                        0, NULL, &entry);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("UL_DECAP: catch-all entry failed: %s",
@@ -751,17 +716,16 @@ build_ul_decap_pipe(dpu_pipeline_ctx_t *ctx)
         return result;
     }
 
-    doca_flow_entries_process(ctx->ports[1], 0, 0, 0);  /* N6 port */
-    DOCA_LOG_INFO("UL_DECAP: EGRESS root on N6 — GTP decap + L2 inject (1 entry)");
+    doca_flow_entries_process(ctx->switch_port, 0, 0, 0);
+    DOCA_LOG_INFO("UL_DECAP: FDB pass-through → N6 (decap DISABLED, 1 entry)");
     return DOCA_SUCCESS;
 }
 
 
-/* ── DL_ENCAP pipe (EGRESS domain on N3 port) ─────────────────────── */
+/* ── DL_ENCAP pipe (FDB pass-through — REFORMAT disabled for bringup) ─ */
 /*
- * EGRESS root on N3 port (ctx->ports[0]).  Same rationale as UL_DECAP:
- * FDB domain has NO ARGUMENT_64B resources for REFORMAT.
- * FDB pipes use FWD_PIPE to route DL traffic into this EGRESS root.
+ * TEMPORARY: No encap action.  Just forwards DL traffic to N3.
+ * TODO: Re-enable GTP encap once ARGUMENT_64B is resolved.
  */
 static doca_error_t
 build_dl_encap_pipe(dpu_pipeline_ctx_t *ctx)
@@ -769,17 +733,15 @@ build_dl_encap_pipe(dpu_pipeline_ctx_t *ctx)
     doca_error_t result;
     struct doca_flow_pipe_cfg *pipe_cfg;
 
-    result = doca_flow_pipe_cfg_create(&pipe_cfg, ctx->ports[0]);  /* N3 port */
+    result = doca_flow_pipe_cfg_create(&pipe_cfg, ctx->switch_port);
     if (result != DOCA_SUCCESS) return result;
 
     doca_flow_pipe_cfg_set_name(pipe_cfg, "DL_ENCAP");
     doca_flow_pipe_cfg_set_type(pipe_cfg, DOCA_FLOW_PIPE_BASIC);
-    doca_flow_pipe_cfg_set_is_root(pipe_cfg, true);
-    doca_flow_pipe_cfg_set_domain(pipe_cfg, DOCA_FLOW_PIPE_DOMAIN_EGRESS);
+    doca_flow_pipe_cfg_set_is_root(pipe_cfg, false);
     doca_flow_pipe_cfg_set_nr_entries(pipe_cfg, 2048);
 
-    /* Match pkt_meta (changeable) — mask ignores reinject bits 0-1
-     * so both normal DL and DL-reinject match the same encap entry */
+    /* Match pkt_meta (changeable) — keep this so entry add/update still works */
     struct doca_flow_match match = {};
     match.meta.pkt_meta = UINT32_MAX;
 
@@ -788,43 +750,14 @@ build_dl_encap_pipe(dpu_pipeline_ctx_t *ctx)
 
     doca_flow_pipe_cfg_set_match(pipe_cfg, &match, &mask);
 
-    /* Action: GTP-U encapsulation with PSC extension */
-    struct doca_flow_actions actions = {};
-    actions.encap_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED;
+    /* NO encap actions — pure pass-through (encap disabled for bringup) */
 
-    /* Outer Ethernet */
-    memcpy(actions.encap_cfg.encap.outer.eth.src_mac,
-           ctx->port_cfg.upf_n3_mac, 6);
-    memcpy(actions.encap_cfg.encap.outer.eth.dst_mac,
-           ctx->port_cfg.gnb_mac, 6);
-    actions.encap_cfg.encap.outer.eth.type = RTE_BE16(0x0800);
-
-    /* Outer IPv4 */
-    actions.encap_cfg.encap.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
-    actions.encap_cfg.encap.outer.ip4.src_ip = ctx->port_cfg.upf_n3_ip;
-    actions.encap_cfg.encap.outer.ip4.dst_ip = UINT32_MAX;   /* changeable */
-    actions.encap_cfg.encap.outer.ip4.ttl = 64;
-
-    /* Outer UDP */
-    actions.encap_cfg.encap.outer.l4_type_ext = DOCA_FLOW_L4_TYPE_EXT_UDP;
-    actions.encap_cfg.encap.outer.udp.l4_port.dst_port = RTE_BE16(GTP_UDP_PORT);
-
-    /* GTP-U tunnel + PSC extension */
-    actions.encap_cfg.encap.tun.type = DOCA_FLOW_TUN_GTPU;
-    actions.encap_cfg.encap.tun.gtp_teid = UINT32_MAX;            /* changeable */
-    actions.encap_cfg.encap.tun.gtp_next_ext_hdr_type = GTP_EXT_PSC;  /* PSC 0x85 */
-    actions.encap_cfg.encap.tun.gtp_ext_psc_qfi = UINT8_MAX;     /* changeable */
-
-    struct doca_flow_actions *actions_arr[] = { &actions };
-    doca_flow_pipe_cfg_set_actions(pipe_cfg, actions_arr, NULL, NULL, 1);
-
-    /* Forward: encap then out N3 wire */
+    /* Forward: out N3 wire (plain IP, no GTP encap, but pipeline runs) */
     struct doca_flow_fwd fwd = {
         .type = DOCA_FLOW_FWD_PORT,
         .port_id = ctx->port_cfg.n3_port_id,
     };
 
-    /* Miss → DROP (unmatched pkt_meta = not tagged by DL_MATCH) */
     struct doca_flow_fwd fwd_miss = {
         .type = DOCA_FLOW_FWD_DROP,
     };
@@ -1156,15 +1089,13 @@ dpu_pipeline_build_pipes(dpu_pipeline_ctx_t *ctx)
         if (result != DOCA_SUCCESS) return result;
     }
 
-    /* UL_DECAP: EGRESS root on N6 port — built before color gates so
-     * UL color gates can FWD_PIPE to it.  Splits GTP decap out of UL_MATCH;
-     * FDB domain lacks ARGUMENT_64B resources for REFORMAT. */
+    /* UL_DECAP: FDB pass-through (decap disabled for bringup).
+     * Built before color gates so UL color gates can FWD_PIPE to it. */
     result = build_ul_decap_pipe(ctx);
     if (result != DOCA_SUCCESS) return result;
 
-    /* DL_ENCAP: EGRESS root on N3 port — built before color gates so
-     * DL color gates can FWD_PIPE to it.  FDB domain lacks ARGUMENT_64B
-     * resources for REFORMAT, so encap must happen in EGRESS. */
+    /* DL_ENCAP: FDB pass-through (encap disabled for bringup).
+     * Built before color gates so DL color gates can FWD_PIPE to it. */
     result = build_dl_encap_pipe(ctx);
     if (result != DOCA_SUCCESS) return result;
 
@@ -1417,35 +1348,16 @@ dpu_pipeline_insert_rule(dpu_pipeline_ctx_t *ctx, const hw_offload_msg_t *msg)
         rec->meter_id     = meter_id;
         rec->is_gbr_flow  = dl_is_gbr;
 
-        /* DL_ENCAP entry: pkt_meta → GTP encap */
+        /* DL_ENCAP entry: pkt_meta tag for this rule (no encap for bringup) */
         if (msg->ohc_desc == HW_OHC_GTPU_UDP_IPV4) {
             struct doca_flow_match encap_match = {};
             encap_match.meta.pkt_meta = htonl(msg->hw_rule_id);
 
-            struct doca_flow_actions encap_actions = {};
-            encap_actions.encap_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED;
-
-            encap_actions.encap_cfg.encap.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
-            encap_actions.encap_cfg.encap.outer.ip4.dst_ip =
-                msg->ohc_ipv4.s_addr;
-            encap_actions.encap_cfg.encap.outer.ip4.src_ip =
-                ctx->port_cfg.upf_n3_ip;
-            encap_actions.encap_cfg.encap.outer.ip4.ttl = 64;
-
-            encap_actions.encap_cfg.encap.outer.l4_type_ext =
-                DOCA_FLOW_L4_TYPE_EXT_UDP;
-            encap_actions.encap_cfg.encap.outer.udp.l4_port.dst_port =
-                RTE_BE16(GTP_UDP_PORT);
-
-            encap_actions.encap_cfg.encap.tun.type = DOCA_FLOW_TUN_GTPU;
-            encap_actions.encap_cfg.encap.tun.gtp_teid =
-                htonl(msg->ohc_teid);
-            encap_actions.encap_cfg.encap.tun.gtp_next_ext_hdr_type = GTP_EXT_PSC;
-            encap_actions.encap_cfg.encap.tun.gtp_ext_psc_qfi = msg->encap_qfi;
+            /* TODO: restore encap_actions when REFORMAT is re-enabled */
 
             struct doca_flow_pipe_entry *encap_entry;
             result = doca_flow_pipe_basic_add_entry(0, ctx->dl_encap_pipe,
-                                               &encap_match, 0, &encap_actions,
+                                               &encap_match, 0, NULL,
                                                NULL, NULL,
                                                0, NULL, &encap_entry);
             if (result != DOCA_SUCCESS) {
@@ -1464,8 +1376,7 @@ dpu_pipeline_insert_rule(dpu_pipeline_ctx_t *ctx, const hw_offload_msg_t *msg)
             rec->dl_encap_entry = encap_entry;
         }
 
-        doca_flow_entries_process(ctx->switch_port, 0, 0, 0);  /* DL_MATCH (FDB) */
-        doca_flow_entries_process(ctx->ports[0], 0, 0, 0);     /* DL_ENCAP (EGRESS on N3) */
+        doca_flow_entries_process(ctx->switch_port, 0, 0, 0);
 
         DOCA_LOG_INFO("DL rule: hw_rule=%u ue_ip=%08x ohc_teid=0x%x "
                       "bucket=P%d meter=%s gbr=%s",
@@ -1532,8 +1443,7 @@ dpu_pipeline_delete_rule(dpu_pipeline_ctx_t *ctx, uint32_t hw_rule_id)
         }
     }
 
-    doca_flow_entries_process(ctx->switch_port, 0, 0, 0);  /* FDB entries */
-    doca_flow_entries_process(ctx->ports[0], 0, 0, 0);     /* DL_ENCAP (EGRESS on N3) */
+    doca_flow_entries_process(ctx->switch_port, 0, 0, 0);
 
     /* If any entry removal failed, do NOT release meter or free record.
      * HW entries may still reference the meter — releasing it could cause
@@ -1731,7 +1641,7 @@ dpu_pipeline_update_far(dpu_pipeline_ctx_t *ctx, const hw_offload_msg_t *msg)
                              doca_error_get_descr(result));
                 return result;
             }
-            doca_flow_entries_process(ctx->ports[0], 0, 0, 0);  /* DL_ENCAP (EGRESS on N3) */
+            doca_flow_entries_process(ctx->switch_port, 0, 0, 0);
 
             DOCA_LOG_INFO("update_far: hw_rule_id=%u ENCAP updated "
                           "teid=0x%x dst_ip=%08x",
@@ -2022,7 +1932,7 @@ dpu_pipeline_update_dlencap_only(dpu_pipeline_ctx_t *ctx,
                      msg->hw_rule_id, doca_error_get_descr(result));
         return result;
     }
-    doca_flow_entries_process(ctx->ports[0], 0, 0, 0);  /* DL_ENCAP (EGRESS on N3) */
+    doca_flow_entries_process(ctx->switch_port, 0, 0, 0);
 
     DOCA_LOG_INFO("update_dlencap_only: hw_rule_id=%u ENCAP updated "
                   "teid=0x%x dst_ip=%08x qfi=%u (before drain)",
