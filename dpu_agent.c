@@ -641,26 +641,40 @@ parse_mac(const char *str, uint8_t mac[6])
  * NOT exist yet — they are created later by doca_dpdk_port_probe() which
  * establishes the DOCA↔DPDK bridge mapping.  Any port configuration
  * (queues, mbuf pool, etc.) must happen after the probe, not here.
+ *
+ * We append "-a pci:00:00.0" (a dummy PCI address that will never match
+ * a real device) to prevent EAL from auto-probing all PCI devices.  Real
+ * devices are probed programmatically via doca_dpdk_port_probe() /
+ * doca_dpdk_port_probe_with_representors().  This matches the NVIDIA DOCA
+ * Flow sample init pattern (flow_common.c → flow_init_dpdk()).
  */
 static doca_error_t
 dpdk_init_cb(int argc, char **argv)
 {
-    int ret = rte_eal_init(argc, argv);
+    /* Append dummy PCI allowlist entry to prevent auto-probe */
+    char *eal_argv[argc + 2];
+    memcpy(eal_argv, argv, sizeof(argv[0]) * argc);
+    eal_argv[argc]     = "-a";
+    eal_argv[argc + 1] = "pci:00:00.0";
+
+    int ret = rte_eal_init(argc + 2, eal_argv);
     if (ret < 0) {
         DOCA_LOG_ERR("EAL initialization failed");
         return DOCA_ERROR_DRIVER;
     }
-    DOCA_LOG_INFO("EAL initialized successfully");
+    DOCA_LOG_INFO("EAL initialized successfully (dummy PCI allowlist, "
+                  "real devices probed via doca_dpdk_port_probe)");
     return DOCA_SUCCESS;
 }
 
 /**
  * Setup the switch proxy port for ARM-side buffering and shaping.
  *
- * Must be called AFTER rte_eal_init() (DPDK port 0 exists from -a probe)
- * but BEFORE dpu_pipeline_create_ports(), because doca_flow_port_start()
- * snapshots the queue state — queues added after port_start are invisible
- * to DOCA Flow RSS pipes.
+ * Must be called AFTER doca_dpdk_port_probe_with_representors() creates
+ * DPDK port 0 (N3 PF) and port 1 (host rep), but BEFORE
+ * dpu_pipeline_create_ports(), because doca_flow_port_start() snapshots the
+ * queue state — queues added after port_start are invisible to DOCA Flow
+ * RSS pipes.
  *
  * Creates mbuf pool, configures Rx/Tx queues on the proxy port, starts it,
  * and registers the dynamic metadata field used by reinject paths.
@@ -765,6 +779,60 @@ setup_proxy_port(void)
                   g_proxy_port_id, TOTAL_RX_QUEUES,
                   BUFFER_RX_QUEUES, SHAPER_RX_QUEUES,
                   TOTAL_TX_QUEUES, BUFFER_NB_MBUFS);
+    return DOCA_SUCCESS;
+}
+
+/**
+ * Setup the N6 PF port with minimal DPDK queues (1 Rx + 1 Tx).
+ *
+ * NVIDIA DOCA Flow samples configure ALL PF ports with Rx/Tx queues and
+ * start them before doca_flow_port_start().  Representor ports are skipped
+ * (they have no queues).  The N6 PF needs at least 1 queue so that
+ * doca_flow_port_start() can snapshot a valid queue configuration.
+ *
+ * @param n6_dpdk_port_id  DPDK port ID of the N6 PF (typically 2 when
+ *                          N3 is probed with representors first).
+ */
+static doca_error_t
+setup_n6_port(uint16_t n6_dpdk_port_id)
+{
+    int ret;
+    struct rte_eth_conf port_conf;
+
+    memset(&port_conf, 0, sizeof(port_conf));
+
+    ret = rte_eth_dev_configure(n6_dpdk_port_id, 1, 1, &port_conf);
+    if (ret < 0) {
+        DOCA_LOG_ERR("Failed to configure N6 port %u: %d",
+                     n6_dpdk_port_id, ret);
+        return DOCA_ERROR_DRIVER;
+    }
+
+    ret = rte_eth_rx_queue_setup(n6_dpdk_port_id, 0, 512,
+                                  rte_socket_id(), NULL, g_mbuf_pool);
+    if (ret < 0) {
+        DOCA_LOG_ERR("Failed to setup Rx queue on N6 port %u: %d",
+                     n6_dpdk_port_id, ret);
+        return DOCA_ERROR_DRIVER;
+    }
+
+    ret = rte_eth_tx_queue_setup(n6_dpdk_port_id, 0, 512,
+                                  rte_socket_id(), NULL);
+    if (ret < 0) {
+        DOCA_LOG_ERR("Failed to setup Tx queue on N6 port %u: %d",
+                     n6_dpdk_port_id, ret);
+        return DOCA_ERROR_DRIVER;
+    }
+
+    ret = rte_eth_dev_start(n6_dpdk_port_id);
+    if (ret < 0) {
+        DOCA_LOG_ERR("Failed to start N6 port %u: %d",
+                     n6_dpdk_port_id, ret);
+        return DOCA_ERROR_DRIVER;
+    }
+
+    DOCA_LOG_INFO("N6 port setup: port=%u, 1 Rx queue, 1 Tx queue",
+                  n6_dpdk_port_id);
     return DOCA_SUCCESS;
 }
 
@@ -936,8 +1004,25 @@ main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
-    /* ── Open DOCA devices for Flow ports ──────────────────────────── */
+    /* ── Open DOCA devices and probe DPDK ports ──────────────────────
+     *
+     * NVIDIA DOCA Flow samples probe devices via doca_dpdk_port_probe()
+     * (never via EAL "-a" flags).  dpdk_init_cb() uses a dummy "-a
+     * pci:00:00.0" to prevent EAL auto-probing.  Probing here creates
+     * DPDK ethdev ports with a proper DOCA↔DPDK bridge mapping so that
+     * doca_flow_port_start(set_dev()) can discover the Rx queues.
+     *
+     * Probe order determines DPDK port IDs:
+     *   probe_with_representors(N3 + host_rep) → port 0 (N3 PF), port 1 (rep)
+     *   probe(N6)                               → port 2 (N6 PF)
+     *
+     * Queue setup (setup_proxy_port + setup_n6_port) configures DPDK
+     * queues on PF ports ONLY — representor ports are skipped, matching
+     * the NVIDIA dpdk_utils.c port_init() pattern.
+     * ─────────────────────────────────────────────────────────────────── */
     doca_error_t dev_result;
+
+    /* 1. Open N3 device */
     dev_result = open_doca_device_by_pci(g_cfg.n3_pci, &g_n3_dev);
     if (dev_result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Cannot open N3 device %s: %s",
@@ -945,17 +1030,44 @@ main(int argc, char *argv[])
         doca_argp_destroy();
         return EXIT_FAILURE;
     }
-    /* Establish DOCA↔DPDK bridge mapping for N3 PF.
-     * Without this, doca_flow_port_start() cannot find the DPDK port's
-     * Rx queues — RSS pipe creation will fail with "queue id not exist". */
-    dev_result = doca_dpdk_port_probe(g_n3_dev, "dv_flow_en=2");
+
+    /* 2. Open VF parent device — needed before probe_with_representors */
+    if (g_cfg.vf_pci[0] != '\0') {
+        dev_result = open_doca_device_by_pci(g_cfg.vf_pci, &g_vf_dev);
+        if (dev_result != DOCA_SUCCESS) {
+            DOCA_LOG_ERR("Cannot open VF device %s: %s",
+                         g_cfg.vf_pci, doca_error_get_descr(dev_result));
+            doca_argp_destroy();
+            return EXIT_FAILURE;
+        }
+    } else {
+        g_vf_dev = g_n3_dev;  /* parent PF — port 2 uses representor */
+    }
+
+    /* 3. Open host PF/VF representor — needed for combined probe */
+    dev_result = open_doca_device_rep_by_pci(g_vf_dev, g_cfg.rep_pci, &g_vf_rep);
     if (dev_result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to probe N3 DPDK port: %s",
-                     doca_error_get_descr(dev_result));
+        DOCA_LOG_ERR("Cannot open host representor %s: %s",
+                     g_cfg.rep_pci, doca_error_get_descr(dev_result));
         doca_argp_destroy();
         return EXIT_FAILURE;
     }
 
+    /* 4. Probe N3 PF + host representor together.
+     * This creates DPDK port 0 (N3 PF) and port 1 (host rep).
+     * The bridge mapping lets doca_flow_port_start(set_dev(g_n3_dev))
+     * find port 0's Rx queues, and set_dev_rep(g_vf_rep) find port 1. */
+    dev_result = doca_dpdk_port_probe_with_representors(
+                     g_n3_dev, "dv_flow_en=2", &g_vf_rep, 1);
+    if (dev_result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to probe N3 + host rep: %s",
+                     doca_error_get_descr(dev_result));
+        doca_argp_destroy();
+        return EXIT_FAILURE;
+    }
+    DOCA_LOG_INFO("Probed N3 PF + host rep → DPDK ports 0, 1");
+
+    /* 5. Open and probe N6 PF → DPDK port 2 */
     dev_result = open_doca_device_by_pci(g_cfg.n6_pci, &g_n6_dev);
     if (dev_result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Cannot open N6 device %s: %s",
@@ -970,30 +1082,7 @@ main(int argc, char *argv[])
         doca_argp_destroy();
         return EXIT_FAILURE;
     }
-    /* VF device: open by PCI if specified, else use N3 device as parent.
-     * In switch mode, port 2 (host VF) needs a representor device — it
-     * shares the parent PF dev but gets its own queue mapping via the rep. */
-    if (g_cfg.vf_pci[0] != '\0') {
-        dev_result = open_doca_device_by_pci(g_cfg.vf_pci, &g_vf_dev);
-        if (dev_result != DOCA_SUCCESS) {
-            DOCA_LOG_ERR("Cannot open VF device %s: %s",
-                         g_cfg.vf_pci, doca_error_get_descr(dev_result));
-            doca_argp_destroy();
-            return EXIT_FAILURE;
-        }
-    } else {
-        g_vf_dev = g_n3_dev;  /* parent PF — port 2 uses representor */
-    }
-    /* Open the host PF/VF representor for Flow port 2.
-     * This provides DOCA Flow with a separate queue mapping context
-     * even when the parent dev is shared with port 0 (N3). */
-    dev_result = open_doca_device_rep_by_pci(g_vf_dev, g_cfg.rep_pci, &g_vf_rep);
-    if (dev_result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Cannot open host representor %s for Flow port 2: %s",
-                     g_cfg.rep_pci, doca_error_get_descr(dev_result));
-        doca_argp_destroy();
-        return EXIT_FAILURE;
-    }
+    DOCA_LOG_INFO("Probed N6 PF → DPDK port 2");
 
     /* ── Comch server ──────────────────────────────────────────────── */
     if (comch_server_init() < 0) {
@@ -1027,14 +1116,24 @@ main(int argc, char *argv[])
     for (int q = 0; q < SHAPER_RX_QUEUES; q++)
         shaper_rss_queues[q] = (uint16_t)(BUFFER_RX_QUEUES + q);
 
-    /* ── Setup proxy port for ARM buffering/shaping ────────────────── *
-     * DPDK port 0 exists after EAL probe (-a flags).  We MUST configure
-     * Rx/Tx queues and start the port BEFORE doca_flow_port_start(),
-     * because port_start snapshots the queue state.  RSS pipes built
-     * later will only see queues that existed at port_start time.      */
-    result = setup_proxy_port();
+    /* ── Setup DPDK queues on PF ports ────────────────────────────── *
+     * DPDK ports now exist from doca_dpdk_port_probe().  We MUST
+     * configure Rx/Tx queues and start PF ports BEFORE
+     * doca_flow_port_start(), because port_start snapshots the queue
+     * state.  RSS pipes built later only see queues that existed at
+     * port_start time.  Representor ports (port 1) are skipped —
+     * they don't need DPDK queues in switch mode. */
+    result = setup_proxy_port();  /* DPDK port 0 — N3 PF: 8 Rx + 2 Tx */
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Proxy port setup failed: %s", doca_error_get_descr(result));
+        comch_server_destroy();
+        doca_argp_destroy();
+        return EXIT_FAILURE;
+    }
+
+    result = setup_n6_port(2);  /* DPDK port 2 — N6 PF: 1 Rx + 1 Tx */
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("N6 port setup failed: %s", doca_error_get_descr(result));
         comch_server_destroy();
         doca_argp_destroy();
         return EXIT_FAILURE;
