@@ -616,8 +616,11 @@ parse_mac(const char *str, uint8_t mac[6])
 /**
  * DPDK EAL init callback — registered via doca_argp_set_dpdk_program().
  * Called by doca_argp_start() after it separates DPDK flags from app flags.
- * Also creates the mbuf pool and configures Rx/Tx queues on the switch
- * proxy port for ARM-side buffering.
+ *
+ * IMPORTANT: At this point only EAL is available.  DPDK ethdev ports do
+ * NOT exist yet — they are created later by doca_flow_port_start() inside
+ * dpu_pipeline_init().  Any port configuration (queues, mbuf pool, etc.)
+ * must happen after pipeline init, not here.
  */
 static doca_error_t
 dpdk_init_cb(int argc, char **argv)
@@ -627,6 +630,23 @@ dpdk_init_cb(int argc, char **argv)
         DOCA_LOG_ERR("EAL initialization failed");
         return DOCA_ERROR_DRIVER;
     }
+    DOCA_LOG_INFO("EAL initialized successfully");
+    return DOCA_SUCCESS;
+}
+
+/**
+ * Setup the switch proxy port for ARM-side buffering and shaping.
+ *
+ * Must be called AFTER dpu_pipeline_init() returns, because DPDK ethdev
+ * port 0 (the switch proxy port) only exists after doca_flow_port_start().
+ *
+ * Creates mbuf pool, configures Rx/Tx queues on the proxy port, starts it,
+ * and registers the dynamic metadata field used by reinject paths.
+ */
+static doca_error_t
+setup_proxy_port(void)
+{
+    int ret;
 
     /* Create mbuf pool for ARM buffer Rx/Tx */
     g_mbuf_pool = rte_pktmbuf_pool_create("BUFFER_POOL",
@@ -718,7 +738,7 @@ dpdk_init_cb(int argc, char **argv)
         return DOCA_ERROR_DRIVER;
     }
 
-    DOCA_LOG_INFO("DPDK init: proxy_port=%u, %d Rx queues (%d buffer + %d shaper), "
+    DOCA_LOG_INFO("Proxy port setup: port=%u, %d Rx queues (%d buffer + %d shaper), "
                   "%d Tx queues, mbuf_pool=%u mbufs",
                   g_proxy_port_id, TOTAL_RX_QUEUES,
                   BUFFER_RX_QUEUES, SHAPER_RX_QUEUES,
@@ -891,6 +911,19 @@ main(int argc, char *argv[])
                                shaper_rss_queues, SHAPER_RX_QUEUES);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Pipeline init failed: %s", doca_error_get_descr(result));
+        comch_server_destroy();
+        doca_argp_destroy();
+        return EXIT_FAILURE;
+    }
+
+    /* ── Setup proxy port for ARM buffering/shaping ────────────────── *
+     * doca_flow_port_start() (inside dpu_pipeline_init) creates DPDK
+     * ethdev port 0 (the switch proxy port).  Only NOW can we configure
+     * Rx/Tx queues and start the port for ARM-side packet I/O.         */
+    result = setup_proxy_port();
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Proxy port setup failed: %s", doca_error_get_descr(result));
+        dpu_pipeline_destroy(&g_pipeline);
         comch_server_destroy();
         doca_argp_destroy();
         return EXIT_FAILURE;
