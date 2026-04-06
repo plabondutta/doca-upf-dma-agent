@@ -1,18 +1,19 @@
 /*
  * dpu_pipeline.h — DOCA Flow pipeline for DPU Agent (switch,hws mode)
  *
- * 17-pipe hierarchy on BlueField-3 with priority-bucketed matching:
+ * Up to 17-pipe hierarchy on BlueField-3 with priority-bucketed matching
+ * (14 base + TO_DPU_ARM + 2 shaped gates, depending on config):
  *   ROOT                   → control pipe (is_root=true), steers by port_id+protocol
  *   UL_MATCH[0..3]         → basic pipes: TEID + QFI + inner src_ip
  *                             chained by precedence, set pkt_meta + meter
  *   DL_MATCH[0..3]         → basic pipes: outer dst_ip (UE IP)
  *                             chained by precedence, set pkt_meta + meter
- *   UL_DECAP               → EGRESS root on N6: GTP decap + L2 inject → N6 wire
+ *   UL_DECAP               → EGRESS root (switch_port): GTP decap + L2 inject → N6 wire
  *   UL_COLOR_GATE_POLICED  → basic pipe: GREEN+YELLOW → FWD_PIPE(UL_DECAP), RED → DROP
  *   DL_COLOR_GATE_POLICED  → basic pipe: GREEN+YELLOW → FWD_PIPE(DL_ENCAP), RED → DROP
  *   UL_COLOR_GATE_SHAPED   → basic pipe: GREEN → FWD_PIPE(UL_DECAP), YELLOW → RSS ARM, RED → DROP
  *   DL_COLOR_GATE_SHAPED   → basic pipe: GREEN → FWD_PIPE(DL_ENCAP), YELLOW → RSS ARM, RED → DROP
- *   DL_ENCAP               → EGRESS root on N3: match pkt_meta → GTP encap + PSC → N3 wire
+ *   DL_ENCAP               → EGRESS root (switch_port): match pkt_meta → GTP encap + PSC → N3 wire
  *   TO_HOST                → basic pipe: catch-all → FWD to Host VF representor
  *   TO_DPU_ARM             → basic pipe: RSS → ARM Rx queues (for idle UE buffering)
  *

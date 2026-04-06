@@ -10,9 +10,9 @@
  *   - pkt_meta-based GTP encap for downlink (with PSC extension)
  *   - TO_DPU_ARM pipe for DL buffering via RSS to ARM Rx queues
  *
- * 14-pipe hierarchy:
- *   ROOT  → UL_MATCH[0..3] → UL_COLOR_GATE → fwd N6
- *         → DL_MATCH[0..3] → DL_COLOR_GATE → fwd N3 → DL_ENCAP (egress)
+ * Up to 17-pipe hierarchy (14 base + TO_DPU_ARM + 2 shaped gates):
+ *   ROOT  → UL_MATCH[0..3] → UL_COLOR_GATE → UL_DECAP (egress) → N6
+ *         → DL_MATCH[0..3] → DL_COLOR_GATE → DL_ENCAP (egress) → N3
  *         → TO_HOST (catch-all)
  *   TO_DPU_ARM: RSS → ARM Rx queues (entered via per-entry fwd swap on BUFF)
  *
@@ -290,15 +290,15 @@ build_to_dpu_arm_pipe(dpu_pipeline_ctx_t *ctx)
 }
 
 
-/* ── Color-gate POLICED: GREEN+YELLOW → wire, RED → DROP ─────────── */
+/* ── Color-gate POLICED: GREEN+YELLOW → pipe, RED → DROP ─────────── */
 /*
  * MBR-only flows (GBR == 0).  Both GREEN and YELLOW traffic forwards
- * to the wire port at line rate.  RED (above MBR) is dropped in HW.
+ * to the EGRESS pipe (UL_DECAP or DL_ENCAP) at line rate.
+ * RED (above MBR) is dropped in HW.
  */
 static doca_error_t
 build_color_gate_policed_pipe(dpu_pipeline_ctx_t *ctx,
                               const char *name,
-                              uint16_t fwd_port_id,
                               struct doca_flow_pipe *fwd_pipe,
                               struct doca_flow_pipe **pipe_out)
 {
@@ -325,14 +325,10 @@ build_color_gate_policed_pipe(dpu_pipeline_ctx_t *ctx,
     struct doca_flow_actions *actions_arr[] = { &actions };
     doca_flow_pipe_cfg_set_actions(pipe_cfg, actions_arr, NULL, NULL, 1);
 
-    struct doca_flow_fwd fwd = {};
-    if (fwd_pipe) {
-        fwd.type = DOCA_FLOW_FWD_PIPE;
-        fwd.next_pipe = fwd_pipe;
-    } else {
-        fwd.type = DOCA_FLOW_FWD_PORT;
-        fwd.port_id = fwd_port_id;
-    }
+    struct doca_flow_fwd fwd = {
+        .type = DOCA_FLOW_FWD_PIPE,
+        .next_pipe = fwd_pipe,
+    };
     struct doca_flow_fwd fwd_miss = {
         .type = DOCA_FLOW_FWD_DROP,
     };
@@ -365,22 +361,21 @@ build_color_gate_policed_pipe(dpu_pipeline_ctx_t *ctx,
     }
 
     doca_flow_entries_process(ctx->switch_port, 0, 0, 0);
-    DOCA_LOG_INFO("%s: GREEN+YELLOW→%s, RED→drop (POLICED)",
-                  name, fwd_pipe ? "pipe" : "wire");
+    DOCA_LOG_INFO("%s: GREEN+YELLOW→pipe, RED→drop (POLICED)", name);
     return DOCA_SUCCESS;
 }
 
 
-/* ── Color-gate SHAPED: GREEN → wire, YELLOW → ARM RSS, RED → DROP ── */
+/* ── Color-gate SHAPED: GREEN → pipe, YELLOW → ARM RSS, RED → DROP ── */
 /*
- * GBR flows (GBR > 0).  GREEN traffic (≤ GBR) goes to wire at line rate.
+ * GBR flows (GBR > 0).  GREEN traffic (≤ GBR) forwards to the EGRESS
+ * pipe (UL_DECAP or DL_ENCAP) at line rate.
  * YELLOW traffic (between GBR and MBR) is redirected to ARM via RSS for
  * software token-bucket shaping at EIR = MBR − GBR.  RED → DROP.
  */
 static doca_error_t
 build_color_gate_shaped_pipe(dpu_pipeline_ctx_t *ctx,
                              const char *name,
-                             uint16_t fwd_port_id,
                              struct doca_flow_pipe *fwd_pipe,
                              uint16_t *rss_queues,
                              uint32_t nr_rss_queues,
@@ -424,15 +419,11 @@ build_color_gate_shaped_pipe(dpu_pipeline_ctx_t *ctx,
 
     struct doca_flow_pipe_entry *entry;
 
-    /* GREEN → wire port or pipe (if fwd_pipe provided) */
-    struct doca_flow_fwd fwd_wire = {};
-    if (fwd_pipe) {
-        fwd_wire.type = DOCA_FLOW_FWD_PIPE;
-        fwd_wire.next_pipe = fwd_pipe;
-    } else {
-        fwd_wire.type = DOCA_FLOW_FWD_PORT;
-        fwd_wire.port_id = fwd_port_id;
-    }
+    /* GREEN → EGRESS pipe (UL_DECAP or DL_ENCAP) */
+    struct doca_flow_fwd fwd_wire = {
+        .type = DOCA_FLOW_FWD_PIPE,
+        .next_pipe = fwd_pipe,
+    };
     struct doca_flow_match green = {};
     green.parser_meta.meter_color = DOCA_FLOW_METER_COLOR_GREEN;
     result = doca_flow_pipe_basic_add_entry(0, *pipe_out,
@@ -464,8 +455,8 @@ build_color_gate_shaped_pipe(dpu_pipeline_ctx_t *ctx,
     }
 
     doca_flow_entries_process(ctx->switch_port, 0, 0, 0);
-    DOCA_LOG_INFO("%s: GREEN→%s, YELLOW→ARM RSS(%u queues), RED→drop (SHAPED)",
-                  name, fwd_pipe ? "pipe" : "wire", nr_rss_queues);
+    DOCA_LOG_INFO("%s: GREEN→pipe, YELLOW→ARM RSS(%u queues), RED→drop (SHAPED)",
+                  name, nr_rss_queues);
     return DOCA_SUCCESS;
 }
 
@@ -651,15 +642,21 @@ build_dl_match_pipes(dpu_pipeline_ctx_t *ctx)
 }
 
 
-/* ── UL_DECAP pipe (EGRESS domain on N6 port) ─────────────────────── */
+/* ── UL_DECAP pipe (EGRESS domain on switch_port) ─────────────────── */
 /*
  * Splits GTP-U decapsulation out of UL_MATCH into a dedicated pipe
- * in the EGRESS domain on the N6 port (ctx->ports[1]).
+ * in the EGRESS domain on the switch_port (switch manager port).
  *
  * WHY EGRESS: The BF3 FDB (eSwitch) domain does NOT provision
  * ARGUMENT_64B resources at all — any REFORMAT action in FDB fails
  * with "cannot get resource(ARGUMENT_64B)".  The EGRESS domain
- * per-NIC-port has its own resource pool that includes REFORMAT.
+ * has its own resource pool that includes REFORMAT.
+ *
+ * WHY switch_port: In switch mode, ALL pipes — including EGRESS
+ * domain — must be created on the switch manager port.  Physical
+ * port handles are used only as fwd.port_id forwarding targets.
+ * (See NVIDIA flow_hash_flooding_pipe sample: create_egress_root_pipe
+ * takes sw_port, not a physical NIC port.)
  *
  * Architecture:
  *   FDB color gates / ROOT reinject use FWD_PIPE to this EGRESS root.
@@ -667,8 +664,7 @@ build_dl_match_pipes(dpu_pipeline_ctx_t *ctx)
  *   pipe is allowed" in switch mode.
  *
  * This pipe matches all GTP-U traffic and applies static decap + L2
- * header injection.  Miss → pass-through to N6 wire (safety net for
- * any non-GTP traffic that reaches N6 EGRESS).
+ * header injection.  Miss → EGRESS default (send to wire).
  *
  * Data-plane path:
  *   UL_MATCH → meter+meta → UL_COLOR_GATE →(FWD_PIPE)→ UL_DECAP → decap → N6 wire
@@ -680,7 +676,7 @@ build_ul_decap_pipe(dpu_pipeline_ctx_t *ctx)
     doca_error_t result;
     struct doca_flow_pipe_cfg *pipe_cfg;
 
-    result = doca_flow_pipe_cfg_create(&pipe_cfg, ctx->ports[1]);  /* N6 port */
+    result = doca_flow_pipe_cfg_create(&pipe_cfg, ctx->switch_port);
     if (result != DOCA_SUCCESS) return result;
 
     doca_flow_pipe_cfg_set_name(pipe_cfg, "UL_DECAP");
@@ -721,13 +717,11 @@ build_ul_decap_pipe(dpu_pipeline_ctx_t *ctx)
         .port_id = ctx->port_cfg.n6_port_id,
     };
 
-    /* Miss → pass through to N6 wire (non-GTP traffic exits untouched) */
-    struct doca_flow_fwd fwd_miss = {
-        .type = DOCA_FLOW_FWD_PORT,
-        .port_id = ctx->port_cfg.n6_port_id,
-    };
+    /* Miss → EGRESS domain default miss = send to wire/representor.
+     * DOCA docs: fwd_miss only supports FWD_PIPE and FWD_DROP.
+     * Passing NULL lets the EGRESS domain default (send to wire) apply. */
 
-    result = doca_flow_pipe_create(pipe_cfg, &fwd, &fwd_miss,
+    result = doca_flow_pipe_create(pipe_cfg, &fwd, NULL,
                                     &ctx->ul_decap_pipe);
     doca_flow_pipe_cfg_destroy(pipe_cfg);
 
@@ -751,16 +745,17 @@ build_ul_decap_pipe(dpu_pipeline_ctx_t *ctx)
         return result;
     }
 
-    doca_flow_entries_process(ctx->ports[1], 0, 0, 0);  /* N6 port */
-    DOCA_LOG_INFO("UL_DECAP: EGRESS root on N6 — GTP decap + L2 inject (1 entry)");
+    doca_flow_entries_process(ctx->switch_port, 0, 0, 0);
+    DOCA_LOG_INFO("UL_DECAP: EGRESS root (switch_port) — GTP decap + L2 inject → N6 (1 entry)");
     return DOCA_SUCCESS;
 }
 
 
-/* ── DL_ENCAP pipe (EGRESS domain on N3 port) ─────────────────────── */
+/* ── DL_ENCAP pipe (EGRESS domain on switch_port) ─────────────────── */
 /*
- * EGRESS root on N3 port (ctx->ports[0]).  Same rationale as UL_DECAP:
- * FDB domain has NO ARGUMENT_64B resources for REFORMAT.
+ * EGRESS root on switch_port (switch manager port).  Same rationale
+ * as UL_DECAP: FDB domain has NO ARGUMENT_64B resources for REFORMAT,
+ * and in switch mode all pipes must be created on switch_port.
  * FDB pipes use FWD_PIPE to route DL traffic into this EGRESS root.
  */
 static doca_error_t
@@ -769,7 +764,7 @@ build_dl_encap_pipe(dpu_pipeline_ctx_t *ctx)
     doca_error_t result;
     struct doca_flow_pipe_cfg *pipe_cfg;
 
-    result = doca_flow_pipe_cfg_create(&pipe_cfg, ctx->ports[0]);  /* N3 port */
+    result = doca_flow_pipe_cfg_create(&pipe_cfg, ctx->switch_port);
     if (result != DOCA_SUCCESS) return result;
 
     doca_flow_pipe_cfg_set_name(pipe_cfg, "DL_ENCAP");
@@ -1005,6 +1000,13 @@ build_root_pipe(dpu_pipeline_ctx_t *ctx)
 /**
  * Create a shared trTCM meter (CIR=GBR, PIR=MBR).
  * Returns NO_METER_ID if both rates are 0 (no QER → skip metering).
+ *
+ * NOTE (switch-mode meter port): All callers pass ctx->switch_port here.
+ * NVIDIA meter samples (flow_shared_meter, upf_accel) allocate from regular
+ * physical ports — but those run in VNF mode, not switch mode.  No NVIDIA
+ * sample demonstrates shared meters in switch mode.  If meter allocation
+ * silently fails at runtime, try ctx->ports[0] (N3 physical port) instead
+ * and verify per-port meter resources via doca_flow_port_cfg_set_nr_resources.
  */
 static doca_error_t
 create_trtcm_meter(struct doca_flow_port *port,
@@ -1095,10 +1097,16 @@ dpu_pipeline_create_ports(dpu_pipeline_ctx_t *ctx,
         ctx->nr_shaper_rss_queues = n;
     }
 
-    result = init_doca_flow(ctx->nr_rss_queues + ctx->nr_shaper_rss_queues);
+    /* pipe_queues = number of concurrent entry-insertion threads.
+     * All add_entry/update_entry calls use pipe_queue=0 (single-threaded),
+     * so 1 is sufficient.  Pass at least 1 even if both RSS configs are 0. */
+    uint32_t pq = ctx->nr_rss_queues + ctx->nr_shaper_rss_queues;
+    if (pq < 1) pq = 1;
+
+    result = init_doca_flow(pq);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("DOCA Flow init failed (pipe_queues=%u): %s",
-                     ctx->nr_rss_queues + ctx->nr_shaper_rss_queues,
+                     pq,
                      doca_error_get_descr(result));
         return result;
     }
@@ -1156,27 +1164,25 @@ dpu_pipeline_build_pipes(dpu_pipeline_ctx_t *ctx)
         if (result != DOCA_SUCCESS) return result;
     }
 
-    /* UL_DECAP: EGRESS root on N6 port — built before color gates so
-     * UL color gates can FWD_PIPE to it.  Splits GTP decap out of UL_MATCH;
-     * FDB domain lacks ARGUMENT_64B resources for REFORMAT. */
+    /* UL_DECAP: EGRESS on switch_port (fwd → N6) — built before color
+     * gates so UL color gates can FWD_PIPE to it.  Splits GTP decap out
+     * of UL_MATCH; FDB domain lacks ARGUMENT_64B resources for REFORMAT. */
     result = build_ul_decap_pipe(ctx);
     if (result != DOCA_SUCCESS) return result;
 
-    /* DL_ENCAP: EGRESS root on N3 port — built before color gates so
-     * DL color gates can FWD_PIPE to it.  FDB domain lacks ARGUMENT_64B
-     * resources for REFORMAT, so encap must happen in EGRESS. */
+    /* DL_ENCAP: EGRESS on switch_port (fwd → N3) — built before color
+     * gates so DL color gates can FWD_PIPE to it.  FDB domain lacks
+     * ARGUMENT_64B resources for REFORMAT, so encap must happen in EGRESS. */
     result = build_dl_encap_pipe(ctx);
     if (result != DOCA_SUCCESS) return result;
 
     /* POLICED color gates: GREEN+YELLOW → pipe (UL_DECAP/DL_ENCAP), RED → DROP */
     result = build_color_gate_policed_pipe(ctx, "UL_COLOR_GATE_POLICED",
-                                           port_cfg->n6_port_id,
                                            ctx->ul_decap_pipe,
                                            &ctx->ul_color_gate_policed_pipe);
     if (result != DOCA_SUCCESS) return result;
 
     result = build_color_gate_policed_pipe(ctx, "DL_COLOR_GATE_POLICED",
-                                           port_cfg->n3_port_id,
                                            ctx->dl_encap_pipe,
                                            &ctx->dl_color_gate_policed_pipe);
     if (result != DOCA_SUCCESS) return result;
@@ -1184,7 +1190,6 @@ dpu_pipeline_build_pipes(dpu_pipeline_ctx_t *ctx)
     /* SHAPED color gates: GREEN → pipe, YELLOW → ARM RSS, RED → DROP (GBR flows) */
     if (ctx->nr_shaper_rss_queues > 0) {
         result = build_color_gate_shaped_pipe(ctx, "UL_COLOR_GATE_SHAPED",
-                                              port_cfg->n6_port_id,
                                               ctx->ul_decap_pipe,
                                               ctx->shaper_rss_queues,
                                               ctx->nr_shaper_rss_queues,
@@ -1192,7 +1197,6 @@ dpu_pipeline_build_pipes(dpu_pipeline_ctx_t *ctx)
         if (result != DOCA_SUCCESS) return result;
 
         result = build_color_gate_shaped_pipe(ctx, "DL_COLOR_GATE_SHAPED",
-                                              port_cfg->n3_port_id,
                                               ctx->dl_encap_pipe,
                                               ctx->shaper_rss_queues,
                                               ctx->nr_shaper_rss_queues,
@@ -1464,8 +1468,7 @@ dpu_pipeline_insert_rule(dpu_pipeline_ctx_t *ctx, const hw_offload_msg_t *msg)
             rec->dl_encap_entry = encap_entry;
         }
 
-        doca_flow_entries_process(ctx->switch_port, 0, 0, 0);  /* DL_MATCH (FDB) */
-        doca_flow_entries_process(ctx->ports[0], 0, 0, 0);     /* DL_ENCAP (EGRESS on N3) */
+        doca_flow_entries_process(ctx->switch_port, 0, 0, 0);
 
         DOCA_LOG_INFO("DL rule: hw_rule=%u ue_ip=%08x ohc_teid=0x%x "
                       "bucket=P%d meter=%s gbr=%s",
@@ -1532,8 +1535,7 @@ dpu_pipeline_delete_rule(dpu_pipeline_ctx_t *ctx, uint32_t hw_rule_id)
         }
     }
 
-    doca_flow_entries_process(ctx->switch_port, 0, 0, 0);  /* FDB entries */
-    doca_flow_entries_process(ctx->ports[0], 0, 0, 0);     /* DL_ENCAP (EGRESS on N3) */
+    doca_flow_entries_process(ctx->switch_port, 0, 0, 0);
 
     /* If any entry removal failed, do NOT release meter or free record.
      * HW entries may still reference the meter — releasing it could cause
@@ -1731,7 +1733,7 @@ dpu_pipeline_update_far(dpu_pipeline_ctx_t *ctx, const hw_offload_msg_t *msg)
                              doca_error_get_descr(result));
                 return result;
             }
-            doca_flow_entries_process(ctx->ports[0], 0, 0, 0);  /* DL_ENCAP (EGRESS on N3) */
+            doca_flow_entries_process(ctx->switch_port, 0, 0, 0);
 
             DOCA_LOG_INFO("update_far: hw_rule_id=%u ENCAP updated "
                           "teid=0x%x dst_ip=%08x",
@@ -2022,7 +2024,7 @@ dpu_pipeline_update_dlencap_only(dpu_pipeline_ctx_t *ctx,
                      msg->hw_rule_id, doca_error_get_descr(result));
         return result;
     }
-    doca_flow_entries_process(ctx->ports[0], 0, 0, 0);  /* DL_ENCAP (EGRESS on N3) */
+    doca_flow_entries_process(ctx->switch_port, 0, 0, 0);
 
     DOCA_LOG_INFO("update_dlencap_only: hw_rule_id=%u ENCAP updated "
                   "teid=0x%x dst_ip=%08x qfi=%u (before drain)",
@@ -2070,30 +2072,35 @@ dpu_pipeline_update_pdr(dpu_pipeline_ctx_t *ctx, const hw_offload_msg_t *msg)
 void
 dpu_pipeline_destroy(dpu_pipeline_ctx_t *ctx)
 {
+    /* Destroy in reverse build order (leaf-first) so that no pipe's
+     * fwd.next_pipe references an already-destroyed pipe while
+     * in-flight packets are still draining. */
     if (ctx->root_pipe)
         doca_flow_pipe_destroy(ctx->root_pipe);
-    if (ctx->dl_encap_pipe)
-        doca_flow_pipe_destroy(ctx->dl_encap_pipe);
-    if (ctx->ul_decap_pipe)
-        doca_flow_pipe_destroy(ctx->ul_decap_pipe);
 
-    for (int p = 0; p < NUM_PRIO_BUCKETS; p++) {
-        if (ctx->dl_match_pipes[p])
-            doca_flow_pipe_destroy(ctx->dl_match_pipes[p]);
-    }
     for (int p = 0; p < NUM_PRIO_BUCKETS; p++) {
         if (ctx->ul_match_pipes[p])
             doca_flow_pipe_destroy(ctx->ul_match_pipes[p]);
     }
+    for (int p = 0; p < NUM_PRIO_BUCKETS; p++) {
+        if (ctx->dl_match_pipes[p])
+            doca_flow_pipe_destroy(ctx->dl_match_pipes[p]);
+    }
 
-    if (ctx->dl_color_gate_shaped_pipe)
-        doca_flow_pipe_destroy(ctx->dl_color_gate_shaped_pipe);
     if (ctx->ul_color_gate_shaped_pipe)
         doca_flow_pipe_destroy(ctx->ul_color_gate_shaped_pipe);
-    if (ctx->dl_color_gate_policed_pipe)
-        doca_flow_pipe_destroy(ctx->dl_color_gate_policed_pipe);
+    if (ctx->dl_color_gate_shaped_pipe)
+        doca_flow_pipe_destroy(ctx->dl_color_gate_shaped_pipe);
     if (ctx->ul_color_gate_policed_pipe)
         doca_flow_pipe_destroy(ctx->ul_color_gate_policed_pipe);
+    if (ctx->dl_color_gate_policed_pipe)
+        doca_flow_pipe_destroy(ctx->dl_color_gate_policed_pipe);
+
+    if (ctx->ul_decap_pipe)
+        doca_flow_pipe_destroy(ctx->ul_decap_pipe);
+    if (ctx->dl_encap_pipe)
+        doca_flow_pipe_destroy(ctx->dl_encap_pipe);
+
     if (ctx->to_dpu_arm_pipe)
         doca_flow_pipe_destroy(ctx->to_dpu_arm_pipe);
     if (ctx->to_host_pipe)
