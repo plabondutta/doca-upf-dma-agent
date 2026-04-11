@@ -886,6 +886,9 @@ build_dl_encap_pipe(dpu_pipeline_ctx_t *ctx)
     if (result != DOCA_SUCCESS)
         DOCA_LOG_ERR("DL_ENCAP pipe creation failed: %s",
                      doca_error_get_descr(result));
+    else
+        DOCA_LOG_INFO("DL_ENCAP: EGRESS root (switch_port) — pkt_meta → GTP encap + PSC → N3 (%u entries)",
+                      2048);
     return result;
 }
 
@@ -895,7 +898,11 @@ build_dl_encap_pipe(dpu_pipeline_ctx_t *ctx)
  * Matches parser_meta.port_id + protocol to steer traffic:
  *   Prio 0: N3 port + GTP-U → UL_MATCH[0]
  *   Prio 1: N6 port + IPv4  → DL_MATCH[0]
- *   Miss:   → TO_HOST
+ *   Prio 2-3: reinject entries (if buffering enabled)
+ *   Prio 255: catch-all → TO_HOST (SW fallback)
+ *
+ * NOTE: Control pipes ignore fwd_miss (DOCA warning), so the catch-all
+ * is implemented as an explicit lowest-priority control entry.
  */
 static doca_error_t
 build_root_pipe(dpu_pipeline_ctx_t *ctx)
@@ -910,12 +917,7 @@ build_root_pipe(dpu_pipeline_ctx_t *ctx)
     doca_flow_pipe_cfg_set_type(pipe_cfg, DOCA_FLOW_PIPE_CONTROL);
     doca_flow_pipe_cfg_set_is_root(pipe_cfg, true);
 
-    struct doca_flow_fwd fwd_miss = {
-        .type = DOCA_FLOW_FWD_PIPE,
-        .next_pipe = ctx->to_host_pipe,
-    };
-
-    result = doca_flow_pipe_create(pipe_cfg, NULL, &fwd_miss,
+    result = doca_flow_pipe_create(pipe_cfg, NULL, NULL,
                                     &ctx->root_pipe);
     doca_flow_pipe_cfg_destroy(pipe_cfg);
     if (result != DOCA_SUCCESS) return result;
@@ -1042,6 +1044,33 @@ build_root_pipe(dpu_pipeline_ctx_t *ctx)
         }
 
         doca_flow_entries_process(ctx->switch_port, 0, 0, 0);
+    }
+
+    /* Priority 255: catch-all → TO_HOST (SW fallback).
+     * Control pipes ignore fwd_miss, so an explicit lowest-priority
+     * entry is required for unmatched traffic to reach the host. */
+    {
+        struct doca_flow_match catch_match = {};
+        struct doca_flow_match catch_mask = {};
+
+        struct doca_flow_fwd catch_fwd = {
+            .type = DOCA_FLOW_FWD_PIPE,
+            .next_pipe = ctx->to_host_pipe,
+        };
+
+        struct doca_flow_pipe_entry *catch_entry;
+        result = doca_flow_pipe_control_add_entry(
+            0, ctx->root_pipe,
+            &catch_match, &catch_mask,
+            NULL, NULL, NULL, NULL,
+            NULL, 255, &catch_fwd, NULL, &catch_entry);
+        if (result != DOCA_SUCCESS) {
+            DOCA_LOG_ERR("ROOT: catch-all entry failed: %s",
+                         doca_error_get_descr(result));
+            return result;
+        }
+        doca_flow_entries_process(ctx->switch_port, 0, 0, 0);
+        DOCA_LOG_INFO("ROOT: prio 255 — catch-all → TO_HOST (SW fallback)");
     }
 
     return DOCA_SUCCESS;
@@ -1305,6 +1334,18 @@ dpu_pipeline_insert_rule(dpu_pipeline_ctx_t *ctx, const hw_offload_msg_t *msg)
                      "ID collision after 24-bit wrap",
                      msg->hw_rule_id);
         return DOCA_ERROR_ALREADY_EXIST;
+    }
+
+    /* Guard: reject unsupported OHC types for DL rules.
+     * Only GTP-U/UDP/IPv4 encap is implemented.  Unsupported types
+     * (IPv6, UDP-only) must stay on the SW fallback path. */
+    if (msg->direction == HW_DIR_DOWNLINK &&
+        msg->ohc_desc != HW_OHC_NONE &&
+        msg->ohc_desc != HW_OHC_GTPU_UDP_IPV4) {
+        DOCA_LOG_WARN("insert_rule: unsupported OHC type %u for DL "
+                      "hw_rule_id=%u — keeping rule on SW path",
+                      msg->ohc_desc, msg->hw_rule_id);
+        return DOCA_ERROR_NOT_SUPPORTED;
     }
 
     /* Select priority bucket from 3GPP precedence */

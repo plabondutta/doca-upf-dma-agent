@@ -229,6 +229,15 @@ comch_recv_cb(struct doca_comch_event_msg_recv *event,
         break;
     }
     case HW_OP_UPDATE_FAR: {
+        /* NOCP-only: control-plane notification to SMF, no data-plane change.
+         * Must be handled before the BUFF/FORW/DROP branches to avoid
+         * accidentally running the DROP cleanup path. */
+        if (msg->apply_action == HW_ACTION_NOCP) {
+            DOCA_LOG_INFO("update_far: NOCP-only for hw_rule_id=%u — "
+                          "no data-plane change", msg->hw_rule_id);
+            break;
+        }
+
         /* State-machine lifecycle for buffer transitions:
          * FAST→BUFF: swap fwd to TO_DPU_ARM, register for buffering.
          * BUFF→FORW: update_dlencap_only → begin_drain → wait_drain_done → HW commit → close.

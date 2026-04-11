@@ -8,7 +8,7 @@
  *                             chained by precedence, set pkt_meta + meter
  *   DL_MATCH[0..3]         → basic pipes: outer dst_ip (UE IP)
  *                             chained by precedence, set pkt_meta + meter
- *   UL_DECAP               → EGRESS root (switch_port): GTP decap + L2 inject → N6 wire
+ *   UL_DECAP               → DEFAULT non-root (switch_port): GTP decap + L2 inject → N6 wire
  *   UL_COLOR_GATE_POLICED  → basic pipe: GREEN+YELLOW → FWD_PIPE(UL_DECAP), RED → DROP
  *   DL_COLOR_GATE_POLICED  → basic pipe: GREEN+YELLOW → FWD_PIPE(DL_ENCAP), RED → DROP
  *   UL_COLOR_GATE_SHAPED   → basic pipe: GREEN → FWD_PIPE(UL_DECAP), YELLOW → RSS ARM, RED → DROP
