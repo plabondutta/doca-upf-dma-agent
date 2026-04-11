@@ -120,6 +120,18 @@ init_doca_flow(uint32_t pipe_queues)
     doca_flow_cfg_set_nr_shared_resource(cfg, 4096,
                                           DOCA_FLOW_SHARED_RESOURCE_METER);
 
+    /* Per-port resource tracking: required so that each port can
+     * independently provision encap/decap/meter ARGUMENT buffers
+     * via doca_flow_port_cfg_set_nr_resources() + actions_mem_size. */
+    result = doca_flow_cfg_set_resource_mode(cfg,
+                                             DOCA_FLOW_RESOURCE_MODE_PORT);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to set resource mode PORT: %s",
+                     doca_error_get_descr(result));
+        doca_flow_cfg_destroy(cfg);
+        return result;
+    }
+
     result = doca_flow_init(cfg);
     doca_flow_cfg_destroy(cfg);
     return result;
@@ -160,13 +172,64 @@ create_port(uint16_t port_id,
         }
     }
 
-    /* Per-port meter resources */
-    result = doca_flow_port_cfg_set_nr_resources(port_cfg,
-        DOCA_FLOW_RESOURCE_METER, 4096);
+    /* ── Per-port resource provisioning ─────────────────────────────
+     * DOCA 3.3 HWS requires pre-allocation of action memory and
+     * resource pools (encap/decap/meter) per port BEFORE port_start.
+     * Without these, any pipe using REFORMAT actions fails with
+     * "cannot get resource(ARGUMENT_64B)".
+     *
+     * Formula from DOCA samples (flow_common.h):
+     *   actions_mem = rte_align32pow2(entries * 128 + 1024)
+     * For MAX_HW_RULES=4096: rte_align32pow2(4096*128+1024) = 1048576.
+     * ────────────────────────────────────────────────────────────────── */
+    static const uint32_t PORT_NR_ENCAP    = MAX_HW_RULES;
+    static const uint32_t PORT_NR_DECAP    = MAX_HW_RULES;
+    static const uint32_t PORT_NR_METER    = MAX_HW_RULES;
+    static const uint32_t PORT_ACTIONS_MEM = 1048576; /* 1 MB, power-of-2 aligned */
+
+    result = doca_flow_port_cfg_set_actions_mem_size(port_cfg,
+                                                     PORT_ACTIONS_MEM);
     if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Port %u: failed to set actions_mem_size=%u: %s",
+                     port_id, PORT_ACTIONS_MEM,
+                     doca_error_get_descr(result));
         doca_flow_port_cfg_destroy(port_cfg);
         return result;
     }
+
+    result = doca_flow_port_cfg_set_nr_resources(port_cfg,
+        DOCA_FLOW_RESOURCE_METER, PORT_NR_METER);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Port %u: failed to set meter resources=%u: %s",
+                     port_id, PORT_NR_METER,
+                     doca_error_get_descr(result));
+        doca_flow_port_cfg_destroy(port_cfg);
+        return result;
+    }
+
+    result = doca_flow_port_cfg_set_nr_resources(port_cfg,
+        DOCA_FLOW_RESOURCE_ENCAP, PORT_NR_ENCAP);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Port %u: failed to set encap resources=%u: %s",
+                     port_id, PORT_NR_ENCAP,
+                     doca_error_get_descr(result));
+        doca_flow_port_cfg_destroy(port_cfg);
+        return result;
+    }
+
+    result = doca_flow_port_cfg_set_nr_resources(port_cfg,
+        DOCA_FLOW_RESOURCE_DECAP, PORT_NR_DECAP);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Port %u: failed to set decap resources=%u: %s",
+                     port_id, PORT_NR_DECAP,
+                     doca_error_get_descr(result));
+        doca_flow_port_cfg_destroy(port_cfg);
+        return result;
+    }
+
+    DOCA_LOG_INFO("Port %u resources: actions_mem=%u encap=%u decap=%u meter=%u",
+                  port_id, PORT_ACTIONS_MEM, PORT_NR_ENCAP,
+                  PORT_NR_DECAP, PORT_NR_METER);
 
     result = doca_flow_port_start(port_cfg, port);
     doca_flow_port_cfg_destroy(port_cfg);
