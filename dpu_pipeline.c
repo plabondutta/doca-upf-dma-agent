@@ -705,29 +705,20 @@ build_dl_match_pipes(dpu_pipeline_ctx_t *ctx)
 }
 
 
-/* ── UL_DECAP pipe (EGRESS domain on switch_port) ─────────────────── */
+/* ── UL_DECAP pipe (DEFAULT domain on switch_port) ────────────────── */
 /*
  * Splits GTP-U decapsulation out of UL_MATCH into a dedicated pipe
- * in the EGRESS domain on the switch_port (switch manager port).
+ * in the DEFAULT domain on the switch_port (switch manager port).
  *
- * WHY EGRESS: The BF3 FDB (eSwitch) domain does NOT provision
- * ARGUMENT_64B resources at all — any REFORMAT action in FDB fails
- * with "cannot get resource(ARGUMENT_64B)".  The EGRESS domain
- * has its own resource pool that includes REFORMAT.
+ * WHY DEFAULT (not EGRESS): DOCA Flow allows only ONE root pipe per
+ * domain per port.  DL_ENCAP already occupies the EGRESS root slot
+ * (DOCA docs: "Encap is suggested to be done from egress" in switch
+ * mode).  Putting DECAP in DEFAULT avoids the conflict and matches
+ * the NVIDIA upf_accel reference application pattern.
+ * Per-port DECAP resources are pre-allocated in create_port().
  *
- * WHY switch_port: In switch mode, ALL pipes — including EGRESS
- * domain — must be created on the switch manager port.  Physical
- * port handles are used only as fwd.port_id forwarding targets.
- * (See NVIDIA flow_hash_flooding_pipe sample: create_egress_root_pipe
- * takes sw_port, not a physical NIC port.)
- *
- * Architecture:
- *   FDB color gates / ROOT reinject use FWD_PIPE to this EGRESS root.
- *   DOCA docs: "forwarding from default domain to egress domain root
- *   pipe is allowed" in switch mode.
- *
- * This pipe matches all GTP-U traffic and applies static decap + L2
- * header injection.  Miss → EGRESS default (send to wire).
+ * This pipe is non-root; it is reached via FWD_PIPE from
+ * UL_COLOR_GATE and ROOT reinject entries (all in DEFAULT domain).
  *
  * Data-plane path:
  *   UL_MATCH → meter+meta → UL_COLOR_GATE →(FWD_PIPE)→ UL_DECAP → decap → N6 wire
@@ -744,8 +735,8 @@ build_ul_decap_pipe(dpu_pipeline_ctx_t *ctx)
 
     doca_flow_pipe_cfg_set_name(pipe_cfg, "UL_DECAP");
     doca_flow_pipe_cfg_set_type(pipe_cfg, DOCA_FLOW_PIPE_BASIC);
-    doca_flow_pipe_cfg_set_is_root(pipe_cfg, true);
-    doca_flow_pipe_cfg_set_domain(pipe_cfg, DOCA_FLOW_PIPE_DOMAIN_EGRESS);
+    doca_flow_pipe_cfg_set_is_root(pipe_cfg, false);
+    doca_flow_pipe_cfg_set_domain(pipe_cfg, DOCA_FLOW_PIPE_DOMAIN_DEFAULT);
     doca_flow_pipe_cfg_set_nr_entries(pipe_cfg, 1);
 
     /* Match: GTP-U tunnel type — always true for traffic entering this pipe,
@@ -780,9 +771,9 @@ build_ul_decap_pipe(dpu_pipeline_ctx_t *ctx)
         .port_id = ctx->port_cfg.n6_port_id,
     };
 
-    /* Miss → EGRESS domain default miss = send to wire/representor.
-     * DOCA docs: fwd_miss only supports FWD_PIPE and FWD_DROP.
-     * Passing NULL lets the EGRESS domain default (send to wire) apply. */
+    /* Miss → NULL.  This pipe has a single catch-all GTP-U entry that
+     * matches everything forwarded here, so miss should never trigger.
+     * In DEFAULT domain, NULL fwd_miss = implicit drop. */
 
     result = doca_flow_pipe_create(pipe_cfg, &fwd, NULL,
                                     &ctx->ul_decap_pipe);
@@ -809,17 +800,18 @@ build_ul_decap_pipe(dpu_pipeline_ctx_t *ctx)
     }
 
     doca_flow_entries_process(ctx->switch_port, 0, 0, 0);
-    DOCA_LOG_INFO("UL_DECAP: EGRESS root (switch_port) — GTP decap + L2 inject → N6 (1 entry)");
+    DOCA_LOG_INFO("UL_DECAP: DEFAULT non-root (switch_port) — GTP decap + L2 inject → N6 (1 entry)");
     return DOCA_SUCCESS;
 }
 
 
 /* ── DL_ENCAP pipe (EGRESS domain on switch_port) ─────────────────── */
 /*
- * EGRESS root on switch_port (switch manager port).  Same rationale
- * as UL_DECAP: FDB domain has NO ARGUMENT_64B resources for REFORMAT,
- * and in switch mode all pipes must be created on switch_port.
- * FDB pipes use FWD_PIPE to route DL traffic into this EGRESS root.
+ * Sole EGRESS root on switch_port.  DOCA docs recommend encap from
+ * EGRESS domain in switch mode.  UL_DECAP lives in DEFAULT domain
+ * to avoid the one-root-per-domain-per-port constraint.
+ * DEFAULT-domain color gates forward DL traffic here via FWD_PIPE
+ * (cross-domain forward from DEFAULT → EGRESS root is allowed).
  */
 static doca_error_t
 build_dl_encap_pipe(dpu_pipeline_ctx_t *ctx)
@@ -1227,15 +1219,13 @@ dpu_pipeline_build_pipes(dpu_pipeline_ctx_t *ctx)
         if (result != DOCA_SUCCESS) return result;
     }
 
-    /* UL_DECAP: EGRESS on switch_port (fwd → N6) — built before color
-     * gates so UL color gates can FWD_PIPE to it.  Splits GTP decap out
-     * of UL_MATCH; FDB domain lacks ARGUMENT_64B resources for REFORMAT. */
+    /* UL_DECAP: DEFAULT non-root on switch_port (fwd → N6) — built before
+     * color gates so UL color gates can FWD_PIPE to it. */
     result = build_ul_decap_pipe(ctx);
     if (result != DOCA_SUCCESS) return result;
 
-    /* DL_ENCAP: EGRESS on switch_port (fwd → N3) — built before color
-     * gates so DL color gates can FWD_PIPE to it.  FDB domain lacks
-     * ARGUMENT_64B resources for REFORMAT, so encap must happen in EGRESS. */
+    /* DL_ENCAP: EGRESS root on switch_port (fwd → N3) — sole EGRESS root.
+     * Built before color gates so DL color gates can FWD_PIPE to it. */
     result = build_dl_encap_pipe(ctx);
     if (result != DOCA_SUCCESS) return result;
 
