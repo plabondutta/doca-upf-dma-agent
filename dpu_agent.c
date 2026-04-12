@@ -629,14 +629,10 @@ comch_server_destroy(void)
         doca_pe_destroy(g_comch_pe);
         g_comch_pe = NULL;
     }
-    if (g_comch_rep) {
-        doca_dev_rep_close(g_comch_rep);
-        g_comch_rep = NULL;
-    }
-    if (g_comch_dev) {
-        doca_dev_close(g_comch_dev);
-        g_comch_dev = NULL;
-    }
+    /* g_comch_rep and g_comch_dev are closed in main() together with
+     * all DOCA device handles, AFTER DPDK ethdev ports are released —
+     * prevents generic_queue teardown ordering issues when g_comch_dev
+     * shares PCI (03:00.0) with g_n3_dev. */
 }
 
 
@@ -1242,47 +1238,56 @@ main(int argc, char *argv[])
     }
 
     /* ── Cleanup ───────────────────────────────────────────────────── */
-    /* Stop shaper Rx lcore */
+    /* Phase 1: Stop data-plane lcores */
     shaper_stop(&g_shaper);
     if (g_shaper_lcore < RTE_MAX_LCORE)
         rte_eal_wait_lcore(g_shaper_lcore);
     shaper_destroy(&g_shaper);
 
-    /* Stop buffer Rx lcore */
     dpu_buffer_stop(&g_buffer);
     if (g_buffer_lcore < RTE_MAX_LCORE)
         rte_eal_wait_lcore(g_buffer_lcore);
-
-    /* Free rte_ring objects and flush residual packets */
     dpu_buffer_destroy(&g_buffer);
 
+    /* Phase 2: DOCA Flow teardown (flush + port_stop reverse + flow_destroy) */
     dpu_pipeline_destroy(&g_pipeline);
+
+    /* Phase 3: Comch shutdown (stop ctx + PE drain + destroy server/PE).
+     * Device handles are deferred to phase 5 so that DPDK ethdev ports
+     * are released first — prevents bridge teardown ordering issues
+     * when g_comch_dev and g_n3_dev share PCI (03:00.0). */
     comch_server_destroy();
 
-    /* Close all DPDK ethdev ports (per dpdk_utils.c::dpdk_ports_fini).
-     * doca_flow_port_stop() stopped DOCA Flow ports but did NOT call
-     * rte_eth_dev_close(), so queue resources are still allocated.
-     * Without rte_eth_dev_close() here, doca_dev_close() below hits
-     * stale generic_queue pointers → "queue=NULL" errors.
-     * Reverse order ensures proxy port (0) closes after children. */
+    /* Phase 4: Release DPDK ethdev ports (per dpdk_utils.c pattern).
+     * doca_flow_port_stop() already stopped each port; rte_eth_dev_close()
+     * releases queue + bridge resources BEFORE any doca_dev_close() runs,
+     * preventing generic_queue=NULL errors from the DOCA DPDK bridge.
+     * Reverse order so proxy port (0) closes after child ports. */
     for (int port_id = RTE_MAX_ETHPORTS - 1; port_id >= 0; port_id--) {
         if (!rte_eth_dev_is_valid_port(port_id))
             continue;
-        rte_eth_dev_stop(port_id);
-        rte_eth_dev_close(port_id);
+        int ret = rte_eth_dev_close(port_id);
+        if (ret != 0)
+            DOCA_LOG_WARN("rte_eth_dev_close(port %d): err=%d", port_id, ret);
     }
 
-    /* Free mbuf pool (used by proxy + N6 Rx/Tx queues) */
+    /* Free DPDK mbuf pool */
     if (g_mbuf_pool)
         rte_mempool_free(g_mbuf_pool);
 
-    /* Release DOCA device handles (VF may alias N3, only close if distinct) */
+    /* Phase 5: Close ALL DOCA device handles (reps first, then devs).
+     * g_comch_dev and g_n3_dev both open PCI 03:00.0 as separate handles;
+     * DOCA ref-counts the underlying driver object, so closing both is safe. */
+    if (g_comch_rep)
+        doca_dev_rep_close(g_comch_rep);
     if (g_vf_rep)
         doca_dev_rep_close(g_vf_rep);
     if (g_vf_dev && g_vf_dev != g_n3_dev)
         doca_dev_close(g_vf_dev);
     if (g_n6_dev)
         doca_dev_close(g_n6_dev);
+    if (g_comch_dev)
+        doca_dev_close(g_comch_dev);
     if (g_n3_dev)
         doca_dev_close(g_n3_dev);
 
