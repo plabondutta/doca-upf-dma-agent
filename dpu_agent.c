@@ -607,7 +607,21 @@ static void
 comch_server_destroy(void)
 {
     if (g_comch_server) {
-        doca_ctx_stop(doca_comch_server_as_ctx(g_comch_server));
+        struct doca_ctx *ctx = doca_comch_server_as_ctx(g_comch_server);
+        doca_error_t result = doca_ctx_stop(ctx);
+
+        /* doca_ctx_stop() is asynchronous — it may return IN_PROGRESS
+         * while the context transitions STOPPING → IDLE.  Drive the PE
+         * until IDLE before destroying any objects. */
+        if (result == DOCA_ERROR_IN_PROGRESS) {
+            enum doca_ctx_states state;
+            doca_ctx_get_state(ctx, &state);
+            while (state != DOCA_CTX_STATE_IDLE) {
+                doca_pe_progress(g_comch_pe);
+                doca_ctx_get_state(ctx, &state);
+            }
+        }
+
         doca_comch_server_destroy(g_comch_server);
         g_comch_server = NULL;
     }

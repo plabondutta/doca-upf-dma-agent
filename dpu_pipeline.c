@@ -2166,41 +2166,18 @@ dpu_pipeline_update_pdr(dpu_pipeline_ctx_t *ctx, const hw_offload_msg_t *msg)
 void
 dpu_pipeline_destroy(dpu_pipeline_ctx_t *ctx)
 {
-    /* Destroy in reverse build order (leaf-first) so that no pipe's
-     * fwd.next_pipe references an already-destroyed pipe while
-     * in-flight packets are still draining. */
-    if (ctx->root_pipe)
-        doca_flow_pipe_destroy(ctx->root_pipe);
-
-    for (int p = 0; p < NUM_PRIO_BUCKETS; p++) {
-        if (ctx->ul_match_pipes[p])
-            doca_flow_pipe_destroy(ctx->ul_match_pipes[p]);
-    }
-    for (int p = 0; p < NUM_PRIO_BUCKETS; p++) {
-        if (ctx->dl_match_pipes[p])
-            doca_flow_pipe_destroy(ctx->dl_match_pipes[p]);
+    /* DOCA Flow teardown sequence (per DOCA 3.3 flow_common.c sample):
+     *  1. Flush all pipes + entries on each port (reverse order)
+     *  2. Stop ports in reverse order — port 0 is the switch proxy
+     *     and MUST stop after all child ports (N6, host VF rep)
+     *  3. doca_flow_destroy() releases global HW resources
+     */
+    for (int i = (int)ctx->nb_ports - 1; i >= 0; i--) {
+        if (ctx->ports[i])
+            doca_flow_port_pipes_flush(ctx->ports[i]);
     }
 
-    if (ctx->ul_color_gate_shaped_pipe)
-        doca_flow_pipe_destroy(ctx->ul_color_gate_shaped_pipe);
-    if (ctx->dl_color_gate_shaped_pipe)
-        doca_flow_pipe_destroy(ctx->dl_color_gate_shaped_pipe);
-    if (ctx->ul_color_gate_policed_pipe)
-        doca_flow_pipe_destroy(ctx->ul_color_gate_policed_pipe);
-    if (ctx->dl_color_gate_policed_pipe)
-        doca_flow_pipe_destroy(ctx->dl_color_gate_policed_pipe);
-
-    if (ctx->ul_decap_pipe)
-        doca_flow_pipe_destroy(ctx->ul_decap_pipe);
-    if (ctx->dl_encap_pipe)
-        doca_flow_pipe_destroy(ctx->dl_encap_pipe);
-
-    if (ctx->to_dpu_arm_pipe)
-        doca_flow_pipe_destroy(ctx->to_dpu_arm_pipe);
-    if (ctx->to_host_pipe)
-        doca_flow_pipe_destroy(ctx->to_host_pipe);
-
-    for (int i = 0; i < ctx->nb_ports; i++) {
+    for (int i = (int)ctx->nb_ports - 1; i >= 0; i--) {
         if (ctx->ports[i])
             doca_flow_port_stop(ctx->ports[i]);
     }
