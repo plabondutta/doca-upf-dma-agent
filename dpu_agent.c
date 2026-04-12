@@ -1259,10 +1259,24 @@ main(int argc, char *argv[])
     dpu_pipeline_destroy(&g_pipeline);
     comch_server_destroy();
 
-    /* Stop proxy port */
-    rte_eth_dev_stop(g_proxy_port_id);
+    /* Close all DPDK ethdev ports (per dpdk_utils.c::dpdk_ports_fini).
+     * doca_flow_port_stop() stopped DOCA Flow ports but did NOT call
+     * rte_eth_dev_close(), so queue resources are still allocated.
+     * Without rte_eth_dev_close() here, doca_dev_close() below hits
+     * stale generic_queue pointers → "queue=NULL" errors.
+     * Reverse order ensures proxy port (0) closes after children. */
+    for (int port_id = RTE_MAX_ETHPORTS - 1; port_id >= 0; port_id--) {
+        if (!rte_eth_dev_is_valid_port(port_id))
+            continue;
+        rte_eth_dev_stop(port_id);
+        rte_eth_dev_close(port_id);
+    }
 
-    /* Close port devices (VF may alias N3, only close if distinct) */
+    /* Free mbuf pool (used by proxy + N6 Rx/Tx queues) */
+    if (g_mbuf_pool)
+        rte_mempool_free(g_mbuf_pool);
+
+    /* Release DOCA device handles (VF may alias N3, only close if distinct) */
     if (g_vf_rep)
         doca_dev_rep_close(g_vf_rep);
     if (g_vf_dev && g_vf_dev != g_n3_dev)
